@@ -27,6 +27,15 @@ void eraseDevice(Adafruit_SSD1306 &display, SecureStorage &eeprom);
 
 void xorKey(Key &k, uint8_t *pin);
 
+// Build a human readable address string from a stored Key.
+// For BTC/BTCT this is the base58 legacy address; for ETH it is the
+// keccak256-derived, EIP-55 checksummed address.
+String keyAddress(const Key &k, bool testnet);
+
+// Derive a checksummed Ethereum address (EIP-55) from a stored Key.
+// The public key is reconstructed from the (PIN-encrypted) private key.
+size_t ethAddressFromKey(const Key &k, char out[43]);
+
 boolean askYesNo(Adafruit_SSD1306 &display);
 char askXorY(Adafruit_SSD1306 &display, String x, String y);
 

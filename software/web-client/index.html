@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Soteria Wallet – Debug Client</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>Soteria Wallet</h1>
+    <p>Hardware wallet debug / test client</p>
+  </header>
+
+  <section id="status-panel">
+    <div class="panel">
+      <h2>Connection</h2>
+      <button id="connect-btn">Connect</button>
+      <div id="status-indicator" class="indicator disconnected">
+        <span class="dot"></span>
+        <span id="status-text">Disconnected</span>
+      </div>
+      <div id="port-info" style="margin-top:6px; font-size:0.9rem; color:#888;"></div>
+    </div>
+  </section>
+
+  <section id="commands-panel">
+    <div class="panel">
+      <h2>Device Commands</h2>
+
+      <div class="cmd-row">
+        <button class="cmd-btn" data-cmd="ADDRESS">ADDRESS</button>
+        <button class="cmd-btn" data-cmd="ERASE">ERASE</button>
+      </div>
+
+      <div class="cmd-row">
+        <label>NAME</label>
+        <input type="text" id="name-input" placeholder="wallet name" maxlength="8" />
+        <button class="cmd-btn" data-cmd="NAME" data-target="name-input">SET NAME</button>
+      </div>
+
+      <div class="cmd-row">
+        <label>Custom</label>
+        <input type="text" id="custom-input" placeholder="raw command" />
+        <button class="cmd-btn" data-cmd="CUSTOM" data-target="custom-input">SEND</button>
+      </div>
+    </div>
+  </section>
+
+  <section id="sign-panel">
+    <div class="panel">
+      <h2>Sign Transaction</h2>
+      <p class="hint">Paste a hex string. For ETH, provide the 32-byte (64-char) Keccak-256 hash to sign.</p>
+
+      <div class="sign-row">
+        <button class="sign-btn" data-network="BTC">Sign BTC</button>
+        <input type="text" id="btc-input" placeholder="BTC tx hex" />
+      </div>
+
+      <div class="sign-row">
+        <button class="sign-btn" data-network="BTCT">Sign BTC Testnet</button>
+        <input type="text" id="btct-input" placeholder="BTC testnet tx hex" />
+      </div>
+
+      <div class="sign-row">
+        <button class="sign-btn" data-network="ETH">Sign ETH hash</button>
+        <input type="text" id="eth-input" placeholder="64 hex chars (keccak256 hash)" maxlength="64" />
+      </div>
+    </div>
+  </section>
+
+  <section id="terminal-panel">
+    <div class="panel">
+      <h2>Serial Log</h2>
+      <div id="terminal" class="terminal"></div>
+      <div style="margin-top:6px;">
+        <button id="clear-btn" class="ghost-btn">Clear log</button>
+      </div>
+    </div>
+  </section>
+
+  <script src="app.js"></script>
+</body>
+</html>
