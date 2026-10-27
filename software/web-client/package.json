@@ -1,0 +1,11 @@
+{
+  "name": "soteria-web-client",
+  "private": true,
+  "description": "Web Serial client for the Soteria hardware wallet (static files; npm is only used for tests)",
+  "scripts": {
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "jsdom": "^24.1.3"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "HostStubs",
+  "version": "1.0.0",
+  "description": "Host (PC/CI) stand-ins for Arduino, I2C EEPROM, USB HID and the OLED, used by `pio test -e native`",
+  "platforms": "native",
+  "dependencies": {
+    "stepansnigirev/uBitcoin": "^0.2.0"
+  }
+}

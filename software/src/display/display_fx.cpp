@@ -45,8 +45,7 @@ void displayQrCode(Adafruit_SSD1306 &display, QRCode &qrcode, uint8_t offset)
                 display.drawPixel(offset+x*2+1, offsety+y*2+1, BLACK);
             }
         }
-}
-  display.display();
+    }
 }
 
 void displayYesNo(Adafruit_SSD1306 &display){
@@ -59,13 +58,12 @@ void displayYesNo(Adafruit_SSD1306 &display){
 	display.setTextColor(WHITE);
 }
 
-void displayXorY(Adafruit_SSD1306 &display, String x, String y){
-	display.setTextSize(1);
-    display.setCursor(0,57);
-	display.setTextColor(BLACK, WHITE);
-	display.print(x);
-	display.setCursor(95,57);
-	display.print(y);
-	display.setTextColor(WHITE);
-	display.display();
+void displayGrouped(Adafruit_SSD1306 &display, const char *text)
+{
+	for (int i = 0; text[i]; i++) {
+		if (i > 0 && i % 16 == 0) display.println();
+		else if (i > 0 && i % 4 == 0) display.print(' ');
+		display.print(text[i]);
+	}
+	display.println();
 }

@@ -3,6 +3,7 @@
 #include <uECC.h>
 #include "utils.h"
 #include "wallet.h"
+#include "buttons.h"
 
 #ifdef SOTERIA_HAS_PLUGGABLE_USB
 #include <USB/USBAPI.h>
@@ -193,11 +194,12 @@ int SoteriaU2F::recvReport(uint8_t* buf, uint8_t maxLen) {
 /* ------------------------------------------------------------------ */
 
 SoteriaU2F::SoteriaU2F()
+    :
 #ifdef SOTERIA_HAS_PLUGGABLE_USB
-    : _epIn(0), _epOut(0), _rxGot(0), _rxExpected(0), _rxSeq(0), _rxCmd(0),
-      _rxCid(0), _rxStart(0), _rxActive(false), _nextCid(0x01000001UL),
-      _signCount(0)
+      _epIn(0), _epOut(0), _rxGot(0), _rxExpected(0), _rxSeq(0), _rxCmd(0),
+      _rxCid(0), _rxLast(0), _rxActive(false), _nextCid(0x01000001UL),
 #endif
+      _display(nullptr), _eeprom(nullptr)
 {
 #ifdef SOTERIA_HAS_PLUGGABLE_USB
     // _hid was constructed (plug() ran) before this body; copy the assigned
@@ -205,13 +207,11 @@ SoteriaU2F::SoteriaU2F()
     _epIn  = _hid.endpointNumber();       // IN endpoint number
     _epOut = _hid.endpointNumber() + 1;   // OUT endpoint number
 #endif
-    for (int i = 0; i < 4; i++) {
-        memset(&_creds[i], 0, sizeof(_creds[i]));
-        _creds[i].inUse = false;
-    }
 }
 
-bool SoteriaU2F::begin() {
+bool SoteriaU2F::begin(Adafruit_SSD1306 &display, SecureStorage &eeprom) {
+    _display = &display;
+    _eeprom = &eeprom;
     // PluggableUSB().plug() was already invoked from the HIDModule
     // constructor (before main() -> USBDevice.init()). Here we only report
     // whether the HID interface is available on this core.
@@ -226,15 +226,22 @@ void SoteriaU2F::poll() {
 #ifdef SOTERIA_HAS_PLUGGABLE_USB
     // Abandon a message whose continuation packets stopped arriving so a
     // single lost packet cannot wedge the transport forever.
-    if (_rxActive && (millis() - _rxStart) > 3000) {
+    if (_rxActive && (millis() - _rxLast) > 1000) {
         _rxActive = false;
+        ctaphidSendError(_rxCid, CTAPHID_ERR_MSG_TIMEOUT);
     }
 
     // The OUT endpoint NAKs while an unread report sits in its bank, so
-    // this loop drains at most what the host has managed to queue up.
-    int n;
-    while ((n = recvReport(_rxPkt, sizeof(_rxPkt))) > 0) {
-        ctaphidPacket(_rxPkt, (uint8_t)n);
+    // only one packet is waiting per call. While a message is half
+    // reassembled, keep reading: the host sends the rest back-to-back and
+    // the caller's loop may not come back for hundreds of milliseconds.
+    for (;;) {
+        int n = recvReport(_rxPkt, sizeof(_rxPkt));
+        if (n > 0) {
+            ctaphidPacket(_rxPkt, (uint8_t)n);
+        } else if (!_rxActive || (millis() - _rxLast) > 50) {
+            break;
+        }
     }
 #endif
 }
@@ -282,7 +289,9 @@ void SoteriaU2F::ctaphidPacket(const uint8_t* pkt, uint8_t len) {
             return;
         }
         if (_rxActive && cid != _rxCid) {
-            return;   // another channel talking mid-message: ignore per spec
+            // another channel talking mid-message: tell it to retry later
+            ctaphidSendError(cid, CTAPHID_ERR_CHANNEL_BUSY);
+            return;
         }
         if (bcnt > sizeof(_rxFrame)) {
             ctaphidSendError(cid, CTAPHID_ERR_INVALID_LEN);
@@ -298,7 +307,7 @@ void SoteriaU2F::ctaphidPacket(const uint8_t* pkt, uint8_t len) {
         _rxGot      = 0;
         _rxSeq      = 0;
         _rxActive   = true;
-        _rxStart    = millis();
+        _rxLast     = millis();
 
         uint16_t copy = avail;
         if (copy > _rxExpected) copy = _rxExpected;
@@ -310,8 +319,7 @@ void SoteriaU2F::ctaphidPacket(const uint8_t* pkt, uint8_t len) {
 
     // ---- continuation packet ----
     if (!_rxActive || cid != _rxCid) {
-        ctaphidSendError(cid, CTAPHID_ERR_INVALID_CID);
-        return;
+        return;   // spurious continuation packet: ignored per spec
     }
     if (b4 != _rxSeq) {
         _rxActive = false;
@@ -319,6 +327,7 @@ void SoteriaU2F::ctaphidPacket(const uint8_t* pkt, uint8_t len) {
         return;
     }
     _rxSeq++;
+    _rxLast = millis();
 
     uint16_t remain = (uint16_t)(_rxExpected - _rxGot);
     uint16_t copy = (uint16_t)(len - 5);
@@ -755,10 +764,17 @@ static bool ecdsaSign(const uint8_t priv[32], const uint8_t hash[32],
 #define CTAP2_ERR_MISSING_PARAMETER 0x14
 #define CTAP2_ERR_CREDENTIAL_EXCLUDED 0x19
 #define CTAP2_ERR_UNSUPPORTED_ALGORITHM 0x26
-#define CTAP2_ERR_KEY_STORE_FULL    0x28
-#define CTAP2_ERR_INVALID_OPTION    0x2C
+#define CTAP2_ERR_OPERATION_DENIED  0x27
+#define CTAP2_ERR_UNSUPPORTED_OPTION 0x2B
+#define CTAP2_ERR_KEEPALIVE_CANCEL  0x2D
 #define CTAP2_ERR_NO_CREDENTIALS    0x2E
+#define CTAP2_ERR_USER_ACTION_TIMEOUT 0x2F
 #define CTAP2_ERR_OTHER             0x7F
+
+#define CTAPHID_STATUS_PROCESSING   0x01   // keepalive payloads
+#define CTAPHID_STATUS_UPNEEDED     0x02
+
+#define FIDO_UP_TIMEOUT_MS          USER_CONFIRM_TIMEOUT_MS
 
 // Fixed device-wide AAGUID: "soteria\0WALLET01".
 static const uint8_t SOTERIA_AAGUID[16] = {
@@ -770,15 +786,110 @@ void SoteriaU2F::ctap2SendStatus(uint8_t code) {
     ctaphidSend(_rxCid, CTAPHID_CMD_CBOR, &code, 1);
 }
 
+/* ------------------------------------------------------------------ */
+/* Stateless credentials (see u2f.h)                                   */
+/* ------------------------------------------------------------------ */
+
+#define CRED_LABEL_KEY 0x01
+#define CRED_LABEL_TAG 0x02
+
+// out = HMAC-SHA256(master, label | rpIdHash | nonce)
+static void credDerive(const uint8_t master[32], uint8_t label, const uint8_t rpIdHash[32],
+                       const uint8_t* nonce, uint8_t out[32]) {
+    uint8_t msg[1 + 32 + FIDO_CRED_NONCE_LEN];
+    msg[0] = label;
+    memcpy(msg + 1, rpIdHash, 32);
+    memcpy(msg + 33, nonce, FIDO_CRED_NONCE_LEN);
+    sha256Hmac(master, 32, msg, sizeof(msg), out);
+}
+
+// If credId (FIDO_CRED_ID_LEN bytes) was minted by this device for this
+// RP, write its private key to priv and return true.
+static bool credOpen(const uint8_t master[32], const uint8_t rpIdHash[32],
+                     const uint8_t* credId, uint8_t priv[32]) {
+    uint8_t tag[32];
+    credDerive(master, CRED_LABEL_TAG, rpIdHash, credId, tag);
+    uint8_t diff = 0;   // constant time: don't leak how much of the tag matched
+    for (uint8_t i = 0; i < FIDO_CRED_TAG_LEN; i++) {
+        diff |= (uint8_t)(tag[i] ^ credId[FIDO_CRED_NONCE_LEN + i]);
+    }
+    if (diff != 0) return false;
+    credDerive(master, CRED_LABEL_KEY, rpIdHash, credId, priv);
+    return true;
+}
+
+// Persistent, so the counter never goes backwards across power cycles
+// (RPs treat a decreasing counter as a cloned authenticator).
+uint32_t SoteriaU2F::nextSignCount() {
+    uint32_t count = _eeprom->readFidoCounter() + 1;
+    _eeprom->writeFidoCounter(count);
+    return count;
+}
+
+// Ask the user to confirm `action` for rpId with the YES button. Returns
+// CTAP2_OK or the CTAP2 error to report. While waiting, the host gets
+// UPNEEDED keepalives and may CANCEL; other channels get CHANNEL_BUSY.
+// Must not touch _rxFrame: the caller's parsed request points into it.
+uint8_t SoteriaU2F::waitForUserPresence(const char* action, const uint8_t* rpId, uint16_t rpIdLen) {
+    if (_display) {
+        Adafruit_SSD1306 &display = *_display;
+        display.clearDisplay();
+        display.setTextColor(WHITE);
+        display.setTextSize(1);
+        display.setCursor(0, 0);
+        display.println("FIDO2 security key");
+        display.println(action);
+        display.println();
+        for (uint16_t i = 0; i < rpIdLen && i < 63; i++) display.print((char)rpId[i]);
+        displayYesNo(display);
+        display.display();
+    }
+
+    // Only a press that starts after the prompt counts (see buttons.h).
+    buttonsArm();
+    uint8_t result = CTAP2_ERR_USER_ACTION_TIMEOUT;
+    uint32_t start = millis();
+    uint32_t lastKeepalive = 0;
+    while (millis() - start < FIDO_UP_TIMEOUT_MS) {
+        if (millis() - lastKeepalive >= 100) {
+            ctaphidSendKeepalive(_rxCid, CTAPHID_STATUS_UPNEEDED);
+            lastKeepalive = millis();
+        }
+        Button b = buttonsPoll();
+        if (b == BTN_YES) { result = CTAP2_OK; break; }
+        if (b == BTN_NO)  { result = CTAP2_ERR_OPERATION_DENIED; break; }
+
+        uint8_t pkt[64];
+        int n = recvReport(pkt, sizeof(pkt));
+        if (n >= 7 && (pkt[4] & CTAPHID_TYPE_INIT)) {
+            uint32_t cid = ((uint32_t)pkt[0] << 24) | ((uint32_t)pkt[1] << 16) |
+                           ((uint32_t)pkt[2] << 8)  |  (uint32_t)pkt[3];
+            if (pkt[4] == CTAPHID_CMD_CANCEL && cid == _rxCid) {
+                result = CTAP2_ERR_KEEPALIVE_CANCEL;
+                break;
+            } else if (pkt[4] == CTAPHID_CMD_INIT && cid != _rxCid && n >= 15) {
+                ctaphidInit(cid, pkt + 7);   // INIT is always answered
+            } else if (cid != _rxCid) {
+                ctaphidSendError(cid, CTAPHID_ERR_CHANNEL_BUSY);
+            }
+        }
+        delay(5);
+    }
+
+    return result;
+}
+
 void SoteriaU2F::ctap2Dispatch(const uint8_t* req, uint16_t reqLen) {
     if (reqLen < 1) { ctap2SendStatus(CTAP2_ERR_INVALID_LEN); return; }
 
-    // Every CTAP2 command except bare getInfo carries a CBOR map payload;
-    // reject anything else (including trailing garbage) up front.
+    // Every CTAP2 command except bare getInfo carries a CBOR map payload
+    // after the command byte; reject anything else (including trailing
+    // garbage) up front.
     if (reqLen > 1) {
+        const uint8_t* map = req + 1;
         const uint8_t* end = req + reqLen;
         CborHead h;
-        if (!cborHead(req, end, h) || h.major != 5 || cborSkip(req, end) != end) {
+        if (!cborHead(map, end, h) || h.major != 5 || cborSkip(map, end) != end) {
             ctap2SendStatus(CTAP2_ERR_INVALID_CBOR);
             return;
         }
@@ -808,12 +919,12 @@ void SoteriaU2F::ctap2GetInfo() {
     cbUint(o, 2); cbArray(o, 0);                           // extensions
     cbUint(o, 3); cbBytes(o, SOTERIA_AAGUID, 16);          // aaguid
     cbUint(o, 4);                                          // options
-    cbMap(o, 5);
+    // "uv" / "clientPin" are omitted on purpose: false would mean "supported
+    // but not configured" and makes platforms try to set up a PIN.
+    cbMap(o, 3);
     cbText(o, "rk");        cbBool(o, false);
     cbText(o, "up");        cbBool(o, true);
-    cbText(o, "uv");        cbBool(o, false);
     cbText(o, "plat");      cbBool(o, false);
-    cbText(o, "clientPin"); cbBool(o, false);
     cbUint(o, 5); cbUint(o, 1024);                         // maxMsgSize
     cbUint(o, 9); cbArray(o, 1); cbText(o, "usb");         // transports
     if (!o.ok) { ctap2SendStatus(CTAP2_ERR_OTHER); return; }
@@ -853,22 +964,11 @@ void SoteriaU2F::ctap2MakeCredential(const uint8_t* req, uint16_t reqLen) {
     uint8_t rpIdHash[32];
     sha256(rpId.data, (size_t)rpId.arg, rpIdHash);
 
-    // 3: user -> id / name / displayName
+    // 3: user — required, but credentials are non-resident so nothing
+    // about the user is kept; only its presence is checked.
     if (!cborMapGetUint(req, end, 3, v) || (v.major != 5 && !v.indef)) {
         ctap2SendStatus(CTAP2_ERR_MISSING_PARAMETER);
         return;
-    }
-    CborVal uId, uName, uDisp;
-    if (!cborMapGetText(v.head, v.end, "id", uId) || uId.major != 2 || uId.indef ||
-        uId.arg == 0 || uId.arg > 64 ||
-        !cborMapGetText(v.head, v.end, "name", uName) || uName.major != 3 || uName.indef ||
-        uName.arg > 64) {
-        ctap2SendStatus(CTAP2_ERR_MISSING_PARAMETER);
-        return;
-    }
-    if (!cborMapGetText(v.head, v.end, "displayName", uDisp) || uDisp.major != 3 ||
-        uDisp.indef || uDisp.arg > 64) {
-        uDisp = uName;   // spec requires it; fall back to "name" if absent
     }
 
     // 4: pubKeyCredParams must offer ES256 (alg -7)
@@ -888,83 +988,86 @@ void SoteriaU2F::ctap2MakeCredential(const uint8_t* req, uint16_t reqLen) {
     }
     if (!algOk) { ctap2SendStatus(CTAP2_ERR_UNSUPPORTED_ALGORITHM); return; }
 
-    // 5: excludeList — refuse an rpId+credential id we already hold
-    if (cborMapGetUint(req, end, 5, v) && (v.major == 4 || v.indef)) {
-        for (uint64_t i = 0; i < v.arg && i < 32; i++) {
-            CborVal el, id;
-            if (!cborArrayGet(v, i, el)) break;
-            if (!cborMapGetText(el.head, el.end, "id", id)) continue;
-            if (id.major != 2 || id.indef || id.arg != 32) continue;
-            for (int c = 0; c < 4; c++) {
-                if (_creds[c].inUse &&
-                    memcmp(_creds[c].credId, id.data, 32) == 0 &&
-                    memcmp(_creds[c].appId, rpIdHash, 32) == 0) {
-                    ctap2SendStatus(CTAP2_ERR_CREDENTIAL_EXCLUDED);
-                    return;
-                }
-            }
-        }
-    }
-
-    // 7: options — resident keys are unsupported (getInfo advertises rk:false)
+    // 7: options — resident keys and built-in user verification are
+    // unsupported (getInfo advertises rk:false and no uv)
     if (cborMapGetUint(req, end, 7, v) && (v.major == 5 || v.indef)) {
-        CborVal rk;
-        if (cborMapGetText(v.head, v.end, "rk", rk) && rk.major == 7 && rk.arg == 21) {
-            ctap2SendStatus(CTAP2_ERR_INVALID_OPTION);
+        CborVal opt;
+        if ((cborMapGetText(v.head, v.end, "rk", opt) && opt.major == 7 && opt.arg == 21) ||
+            (cborMapGetText(v.head, v.end, "uv", opt) && opt.major == 7 && opt.arg == 21)) {
+            ctap2SendStatus(CTAP2_ERR_UNSUPPORTED_OPTION);
             return;
         }
     }
 
-    // Find a free credential slot (credentials are RAM-only on this build)
-    int slot = -1;
-    for (int i = 0; i < 4; i++) {
-        if (!_creds[i].inUse) { slot = i; break; }
+    // No master secret until a wallet has been generated on the device.
+    uint8_t master[32];
+    if (!_eeprom || !loadFidoSecret(*_eeprom, master)) {
+        ctap2SendStatus(CTAP2_ERR_OPERATION_DENIED);
+        return;
     }
-    if (slot < 0) { ctap2SendStatus(CTAP2_ERR_KEY_STORE_FULL); return; }
 
-    // Key material: ADC noise folded with rpIdHash + user id + timestamp so
-    // every credential differs even if the noise source misbehaves. RNGpin
-    // polls analogRead() until the pin toggles, so warn the host first.
-    ctaphidSendKeepalive(_rxCid, 0x01);   // 0x01 = processing
+    // 5: excludeList — if we minted one of these ids for this RP the key is
+    // already registered; the spec wants user presence before saying so.
+    if (cborMapGetUint(req, end, 5, v) && (v.major == 4 || v.indef)) {
+        for (uint64_t i = 0; i < v.arg && i < 32; i++) {
+            CborVal el, id;
+            uint8_t priv[32];
+            if (!cborArrayGet(v, i, el)) break;
+            if (!cborMapGetText(el.head, el.end, "id", id)) continue;
+            if (id.major != 2 || id.indef || id.arg != FIDO_CRED_ID_LEN) continue;
+            if (credOpen(master, rpIdHash, id.data, priv)) {
+                uint8_t st = waitForUserPresence("Already registered", rpId.data, (uint16_t)rpId.arg);
+                ctap2SendStatus(st == CTAP2_OK ? CTAP2_ERR_CREDENTIAL_EXCLUDED : st);
+                return;
+            }
+        }
+    }
+
+    uint8_t st = waitForUserPresence("Register?", rpId.data, (uint16_t)rpId.arg);
+    if (st != CTAP2_OK) { ctap2SendStatus(st); return; }
+
+    // New credential: a random nonce (ADC noise, whitened with SHA-256)
+    // plus key and tag derived from it. Retry in the ~2^-32 case where the
+    // HMAC output is not a valid P-256 scalar.
+    uint8_t credId[FIDO_CRED_ID_LEN];
     uint8_t priv[32];
-    RNGpin(_txBuf, 32);
-    memcpy(_txBuf + 32, rpIdHash, 32);
-    memcpy(_txBuf + 64, uId.data, (size_t)uId.arg);
-    uint32_t now = millis();
-    memcpy(_txBuf + 64 + uId.arg, &now, 4);
-    sha256(_txBuf, 68 + (size_t)uId.arg, priv);
-    priv[0] &= 0xF8;    // keep the scalar inside [2^254, 2^255): nonzero and < n
-    priv[31] &= 0x7F;
-    priv[31] |= 0x40;
-
     uint8_t pub[64];    // uncompressed P-256 point: x || y
-    if (!uECC_compute_public_key(priv, pub, uECC_secp256r1())) {
+    bool keyOk = false;
+    for (int attempt = 0; attempt < 4 && !keyOk; attempt++) {
+        ctaphidSendKeepalive(_rxCid, CTAPHID_STATUS_PROCESSING);
+        uint8_t noise[16 + 4];
+        RNGpin(noise, 16);
+        uint32_t now = micros();
+        memcpy(noise + 16, &now, 4);
+        uint8_t h[32];
+        sha256(noise, sizeof(noise), h);
+        memcpy(credId, h, FIDO_CRED_NONCE_LEN);
+        credDerive(master, CRED_LABEL_TAG, rpIdHash, credId, h);
+        memcpy(credId + FIDO_CRED_NONCE_LEN, h, FIDO_CRED_TAG_LEN);
+        credDerive(master, CRED_LABEL_KEY, rpIdHash, credId, priv);
+        keyOk = uECC_compute_public_key(priv, pub, uECC_secp256r1());
+    }
+    if (!keyOk) {
         ctap2SendStatus(CTAP2_ERR_OTHER);
         return;
     }
-    ctaphidSendKeepalive(_rxCid, 0x01);
-
-    // Credential id: SHA-256(priv || rpIdHash) — opaque, unique per rp.
-    memcpy(_txBuf, priv, 32);
-    memcpy(_txBuf + 32, rpIdHash, 32);
-    uint8_t credId[32];
-    sha256(_txBuf, 64, credId);
+    ctaphidSendKeepalive(_rxCid, CTAPHID_STATUS_PROCESSING);
 
     // Authenticator data:
     //   rpIdHash(32) | flags(1) | signCount(4) | attestedCredData
     //   attestedCredData = aaguid(16) | credIdLen(2) | credId | COSE key
-    _signCount++;
+    uint32_t signCount = nextSignCount();
     uint8_t authData[196];
     memcpy(authData, rpIdHash, 32);
     authData[32] = 0x41;    // UP (0x01) | AT (0x40)
-    authData[33] = (uint8_t)(_signCount >> 24);
-    authData[34] = (uint8_t)(_signCount >> 16);
-    authData[35] = (uint8_t)(_signCount >> 8);
-    authData[36] = (uint8_t)_signCount;
+    authData[33] = (uint8_t)(signCount >> 24);
+    authData[34] = (uint8_t)(signCount >> 16);
+    authData[35] = (uint8_t)(signCount >> 8);
+    authData[36] = (uint8_t)signCount;
     uint8_t* p = authData + 37;
     memcpy(p, SOTERIA_AAGUID, 16); p += 16;
-    *p++ = 0; *p++ = 32;                    // credential id length (BE)
-    memcpy(p, credId, 32); p += 32;
+    *p++ = 0; *p++ = FIDO_CRED_ID_LEN;      // credential id length (BE)
+    memcpy(p, credId, FIDO_CRED_ID_LEN); p += FIDO_CRED_ID_LEN;
     *p++ = 0xA5;                            // COSE_Key, map(5)
     *p++ = 0x01; *p++ = 0x02;               //  1: kty = EC2
     *p++ = 0x03; *p++ = 0x26;               //  3: alg = ES256 (-7)
@@ -984,22 +1087,6 @@ void SoteriaU2F::ctap2MakeCredential(const uint8_t* req, uint16_t reqLen) {
         ctap2SendStatus(CTAP2_ERR_OTHER);
         return;
     }
-
-    // Everything succeeded — publish the credential.
-    U2fCredential* c = &_creds[slot];
-    memset(c, 0, sizeof(*c));
-    c->inUse = true;
-    c->keyHandleLen = 32;
-    memcpy(c->keyHandle, priv, 32);
-    memcpy(c->publicKey, pub, 64);
-    memcpy(c->appId, rpIdHash, 32);
-    memcpy(c->credId, credId, 32);
-    memcpy(c->userId, uId.data, (size_t)uId.arg);
-    c->userIdLen = (uint8_t)uId.arg;
-    memcpy(c->userName, uName.data, (size_t)uName.arg);
-    c->userNameLen = (uint8_t)uName.arg;
-    memcpy(c->userDisplay, uDisp.data, (size_t)uDisp.arg);
-    c->userDisplayLen = (uint8_t)uDisp.arg;
 
     // {1: "packed", 2: authData, 3: {"alg": -7, "sig": ...}}
     CborOut o;
@@ -1028,13 +1115,14 @@ void SoteriaU2F::ctap2GetAssertion(const uint8_t* req, uint16_t reqLen) {
     CborVal v;
 
     // 1: rpId
-    if (!cborMapGetUint(req, end, 1, v) || v.major != 3 || v.indef ||
-        v.arg == 0 || v.arg > 253) {
+    CborVal rpId;
+    if (!cborMapGetUint(req, end, 1, rpId) || rpId.major != 3 || rpId.indef ||
+        rpId.arg == 0 || rpId.arg > 253) {
         ctap2SendStatus(CTAP2_ERR_MISSING_PARAMETER);
         return;
     }
     uint8_t rpIdHash[32];
-    sha256(v.data, (size_t)v.arg, rpIdHash);
+    sha256(rpId.data, (size_t)rpId.arg, rpIdHash);
 
     // 2: clientDataHash
     if (!cborMapGetUint(req, end, 2, v) || v.major != 2 || v.indef || v.arg != 32) {
@@ -1043,75 +1131,80 @@ void SoteriaU2F::ctap2GetAssertion(const uint8_t* req, uint16_t reqLen) {
     }
     const uint8_t* clientDataHash = v.data;
 
-    // Select the credential: by allowList id if one was given, otherwise
-    // any credential belonging to this rpId (getInfo advertises rk:false,
-    // so well-behaved platforms always send an allowList).
-    U2fCredential* cred = nullptr;
-    bool fromAllowList = false;
+    // 5: options — "uv": true cannot be honoured; "up": false is a silent
+    // probe (no prompt, UP flag left clear)
+    bool wantUp = true;
+    if (cborMapGetUint(req, end, 5, v) && (v.major == 5 || v.indef)) {
+        CborVal opt;
+        if (cborMapGetText(v.head, v.end, "uv", opt) && opt.major == 7 && opt.arg == 21) {
+            ctap2SendStatus(CTAP2_ERR_UNSUPPORTED_OPTION);
+            return;
+        }
+        if (cborMapGetText(v.head, v.end, "up", opt) && opt.major == 7 && opt.arg == 20) {
+            wantUp = false;
+        }
+    }
+
+    uint8_t master[32];
+    if (!_eeprom || !loadFidoSecret(*_eeprom, master)) {
+        ctap2SendStatus(CTAP2_ERR_NO_CREDENTIALS);
+        return;
+    }
+
+    // 3: allowList — credentials are non-resident, so without one there
+    // is nothing to look up. Take the first id we minted for this RP.
+    const uint8_t* credId = nullptr;
+    uint8_t priv[32];
     if (cborMapGetUint(req, end, 3, v) && (v.major == 4 || v.indef)) {
-        fromAllowList = true;
         for (uint64_t i = 0; i < v.arg && i < 32; i++) {
             CborVal el, id;
             if (!cborArrayGet(v, i, el)) break;
             if (!cborMapGetText(el.head, el.end, "id", id)) continue;
-            if (id.major != 2 || id.indef || id.arg != 32) continue;
-            for (int c = 0; c < 4; c++) {
-                if (_creds[c].inUse && memcmp(_creds[c].credId, id.data, 32) == 0) {
-                    cred = &_creds[c];
-                    break;
-                }
-            }
-            if (cred) break;
-        }
-    } else {
-        for (int c = 0; c < 4; c++) {
-            if (_creds[c].inUse && memcmp(_creds[c].appId, rpIdHash, 32) == 0) {
-                cred = &_creds[c];
+            if (id.major != 2 || id.indef || id.arg != FIDO_CRED_ID_LEN) continue;
+            if (credOpen(master, rpIdHash, id.data, priv)) {
+                credId = id.data;
                 break;
             }
         }
     }
-    if (!cred) { ctap2SendStatus(CTAP2_ERR_NO_CREDENTIALS); return; }
+    if (!credId) { ctap2SendStatus(CTAP2_ERR_NO_CREDENTIALS); return; }
 
-    // options (key 5): up/uv are not enforced on this MVP build — no button
-    // or biometric check exists, and platforms learn uv:false from getInfo.
+    if (wantUp) {
+        uint8_t st = waitForUserPresence("Sign in?", rpId.data, (uint16_t)rpId.arg);
+        if (st != CTAP2_OK) { ctap2SendStatus(st); return; }
+    }
 
     // Authenticator data: rpIdHash(32) | flags(UP) | signCount(4) | hash(32)
-    _signCount++;
+    // Silent probes (platforms filter allowLists with them; the RP never
+    // sees the result) reuse the current count instead of wearing EEPROM.
+    uint32_t signCount = wantUp ? nextSignCount() : _eeprom->readFidoCounter();
     uint8_t authData[69];
     memcpy(authData, rpIdHash, 32);
-    authData[32] = 0x01;
-    authData[33] = (uint8_t)(_signCount >> 24);
-    authData[34] = (uint8_t)(_signCount >> 16);
-    authData[35] = (uint8_t)(_signCount >> 8);
-    authData[36] = (uint8_t)_signCount;
+    authData[32] = wantUp ? 0x01 : 0x00;
+    authData[33] = (uint8_t)(signCount >> 24);
+    authData[34] = (uint8_t)(signCount >> 16);
+    authData[35] = (uint8_t)(signCount >> 8);
+    authData[36] = (uint8_t)signCount;
     memcpy(authData + 37, clientDataHash, 32);
 
     uint8_t hash[32];
     sha256(authData, 69, hash);
     uint8_t sig[76], sigLen = 0;
-    if (!ecdsaSign(cred->keyHandle, hash, sig, &sigLen)) {
+    if (!ecdsaSign(priv, hash, sig, &sigLen)) {
         ctap2SendStatus(CTAP2_ERR_OTHER);
         return;
     }
 
-    // {1: credential, 2: authData, 3: signature [, 4: user]}
+    // {1: credential, 2: authData, 3: signature}
     CborOut o;
     cbInit(o, _txBuf + 1, (uint16_t)(sizeof(_txBuf) - 1));
-    cbMap(o, fromAllowList ? 3 : 4);
+    cbMap(o, 3);
     cbUint(o, 1);                                  // credential
     cbMap(o, 2);
-    cbText(o, "id");   cbBytes(o, cred->credId, 32);
+    cbText(o, "id");   cbBytes(o, credId, FIDO_CRED_ID_LEN);
     cbText(o, "type"); cbText(o, "public-key");
     cbUint(o, 2); cbBytes(o, authData, 37);        // authData
     cbUint(o, 3); cbBytes(o, sig, sigLen);         // signature
-    if (!fromAllowList) {
-        cbUint(o, 4);                              // user (discoverable case)
-        cbMap(o, 3);
-        cbText(o, "id");          cbBytes(o, cred->userId, cred->userIdLen);
-        cbText(o, "name");        cbTextN(o, (const char*)cred->userName, cred->userNameLen);
-        cbText(o, "displayName"); cbTextN(o, (const char*)cred->userDisplay, cred->userDisplayLen);
-    }
     if (!o.ok) { ctap2SendStatus(CTAP2_ERR_OTHER); return; }
 
     _txBuf[0] = CTAP2_OK;
@@ -1119,10 +1212,5 @@ void SoteriaU2F::ctap2GetAssertion(const uint8_t* req, uint16_t reqLen) {
 }
 
 #endif // SOTERIA_HAS_PLUGGABLE_USB
-
-U2fCredential* SoteriaU2F::credentialAt(int index) {
-    if (index < 0 || index >= 4) return nullptr;
-    return &_creds[index];
-}
 
 SoteriaU2F gU2F;

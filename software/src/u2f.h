@@ -4,6 +4,8 @@
 #include <Arduino.h>
 #include <uECC.h>
 #include <Key.h>
+#include <Adafruit_SSD1306.h>
+#include <SecureStorage.h>
 
 // The PluggableUSB API (needed for the USB HID/CTAPHID interface) is only
 // present on the Adafruit SAMD fork, not on vanilla arduino-samd. Gate on a
@@ -38,6 +40,8 @@
 #define CTAPHID_ERR_INVALID_CMD 0x01
 #define CTAPHID_ERR_INVALID_LEN 0x02
 #define CTAPHID_ERR_INVALID_SEQ 0x03
+#define CTAPHID_ERR_MSG_TIMEOUT 0x05
+#define CTAPHID_ERR_CHANNEL_BUSY 0x06
 #define CTAPHID_ERR_INVALID_CID 0x07
 #define CTAPHID_ERR_OTHER       0x08
 
@@ -51,23 +55,18 @@
 #define CTAP2_CMD_GET_INFO        0x04
 
 /* ------------------------------------------------------------------ */
-/* U2F credential                                                     */
+/* Credentials                                                         */
+/*                                                                     */
+/* Non-resident and stateless: nothing per-site is stored. The         */
+/* credential id the RP keeps is nonce(16) | tag(16) and both the       */
+/* P-256 key and the tag are HMACs of the FIDO master secret (EEPROM    */
+/* key slot FIDO_KEY_SLOT) over rpIdHash | nonce, so credentials        */
+/* survive power cycles and there is no slot limit.                     */
 /* ------------------------------------------------------------------ */
 
-struct U2fCredential {
-    uint8_t keyHandle[32];   // P-256 private key; never leaves the device
-    uint8_t keyHandleLen;
-    uint8_t publicKey[64];   // P-256 uncompressed public key (x||y, 64 bytes)
-    uint8_t appId[32];       // SHA-256 of the relying-party id
-    uint8_t credId[32];      // CTAP2 credential id handed to the RP
-    uint8_t userId[64];      // user handle the RP supplied at registration
-    uint8_t userName[64];
-    uint8_t userDisplay[64];
-    uint8_t userIdLen;
-    uint8_t userNameLen;
-    uint8_t userDisplayLen;
-    bool    inUse;
-};
+#define FIDO_CRED_NONCE_LEN 16
+#define FIDO_CRED_TAG_LEN   16
+#define FIDO_CRED_ID_LEN    (FIDO_CRED_NONCE_LEN + FIDO_CRED_TAG_LEN)
 
 /* ------------------------------------------------------------------ */
 /* USB HID + CTAPHID + U2F device                                     */
@@ -78,14 +77,13 @@ public:
     SoteriaU2F();
 
     // Call once from setup(). Registers the HID interface when the core
-    // supports PluggableUSB; otherwise a no-op.
-    bool begin();
+    // supports PluggableUSB; otherwise a no-op. The display and buttons
+    // are used for the user-presence prompt, the EEPROM for the master
+    // secret and signature counter.
+    bool begin(Adafruit_SSD1306 &display, SecureStorage &eeprom);
 
     // Call repeatedly from loop(). Services incoming HID reports.
     void poll();
-
-    U2fCredential* credentialAt(int index);
-    int    credentialCount() const { return 4; }
 
 #ifdef SOTERIA_HAS_PLUGGABLE_USB
 private:
@@ -118,10 +116,9 @@ private:
     uint8_t  _rxSeq;            // next continuation sequence number expected
     uint8_t  _rxCmd;            // command of the message being reassembled
     uint32_t _rxCid;            // channel of the message being reassembled
-    uint32_t _rxStart;          // millis() of its first packet (timeout)
+    uint32_t _rxLast;           // millis() of its latest packet (timeout)
     bool     _rxActive;         // a message is currently being reassembled
     uint32_t _nextCid;          // last channel id handed out by INIT
-    uint32_t _signCount;        // authenticator signature counter (authData)
     uint8_t  _txBuf[512];       // staging buffer for CTAP2 responses
 
     // --- CTAPHID transport -----------------------------------------
@@ -139,10 +136,12 @@ private:
     void ctap2MakeCredential(const uint8_t* req, uint16_t reqLen);
     void ctap2GetAssertion(const uint8_t* req, uint16_t reqLen);
     void ctap2SendStatus(uint8_t code);
+    uint8_t  waitForUserPresence(const char* action, const uint8_t* rpId, uint16_t rpIdLen);
+    uint32_t nextSignCount();
 #endif
 
-    // --- credential store (both builds; credentialAt() exposes it) --
-    U2fCredential _creds[4];
+    Adafruit_SSD1306* _display;
+    SecureStorage*    _eeprom;
 };
 
 extern SoteriaU2F gU2F;

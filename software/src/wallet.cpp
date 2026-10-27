@@ -1,12 +1,13 @@
 #include "wallet.h"
 #include "bip39.h"
 #include "utils.h"
-#define YES 38
-#define NO 2
+#include "crypto/ethtx.h"
+#include "crypto/btchd.h"
+#include "buttons.h"
 
-#ifndef A7
-#define A7 A5   // fallback analog pin for boards without a 7th ADC channel
-#endif
+// Placeholder: this board revision has no PIN potentiometer wired to an
+// analog input, so every PIN digit reads as 7 (PIN = 77777).
+#define PIN_PLACEHOLDER_DIGIT 7
 
 String getWordsInString(String data, char separator, int index)
 {
@@ -69,11 +70,38 @@ int RNGpin(uint8_t *dest, unsigned size) {
   return 1;
 }
 
+static WalletAddresses s_addresses;
+static bool s_addressesValid = false;
+
+const WalletAddresses &walletAddresses(SecureStorage &eeprom){
+  if (s_addressesValid) return s_addresses;
+  WalletAddresses &a = s_addresses;
+  memset(&a, 0, sizeof(a));
+  Key btc, eth, btct;
+  eeprom.getKey(0, btc);
+  eeprom.getKey(1, eth);
+  eeprom.getKey(2, btct);
+  keyAddress(btc, false).toCharArray(a.btcLegacy, sizeof(a.btcLegacy));
+  keyAddress(btct, true).toCharArray(a.btcTestLegacy, sizeof(a.btcTestLegacy));
+  ethAddressFromKey(eth, a.eth);
+  HdRecord hd;
+  a.segwit = eeprom.readHd(hd);
+  if (a.segwit) {
+    hdAddress(hd, false, 0, 0, a.btc, sizeof(a.btc));
+    hdAddress(hd, true, 0, 0, a.btcTest, sizeof(a.btcTest));
+  }
+  s_addressesValid = true;
+  return a;
+}
+
+void forgetWalletAddresses(){
+  s_addressesValid = false;
+}
+
 size_t ethAddressFromKey(const Key &k, char out[43]){
-  // Reconstruct the uncompressed public key (0x04 || x || y) from the
-  // PIN-encrypted private key, then derive the Ethereum address.
-  PrivateKey pk(k.privateKey.data(), true, &Mainnet);
-  PublicKey pub = pk.publicKey();
+  // The private key is PIN-encrypted, so expand the stored compressed
+  // public key to 0x04 || x || y and derive the Ethereum address from it.
+  PublicKey pub(k.publicKey.data());
   pub.compressed = false;                 // uncompressed for Ethereum
   uint8_t unpk[65];
   pub.sec(unpk, 65);
@@ -99,20 +127,13 @@ void generateWallet(Adafruit_SSD1306 &display,SecureStorage &eeprom)
   uint8_t pin1[5];
   uint8_t seed[32];
 
-  askPin(display, pin);
-  display.setCursor(15, 0);
-  display.print("Input pin again to verify");
-  display.display();
-  delay(2000);
-  askPin(display, pin1);
-  display.setCursor(15, 0);
-  for(int i=0; i<5;i++)
-    if(pin[i]!=pin1[i]){
-      display.print("Pins do not match!");
-      display.display();
-      delay(2000);
-      return;
-    }
+  if (!askPin(display, pin)) return;
+  showMessage(display, "Enter the same PIN\nagain to confirm.", 1500);
+  if (!askPin(display, pin1)) return;
+  if (memcmp(pin, pin1, sizeof(pin)) != 0) {
+    showMessage(display, "PINs do not match!", 2000);
+    return;
+  }
   display.clearDisplay();
   displaySandglass(display);
   displayProgressBar(display);
@@ -127,6 +148,9 @@ void generateWallet(Adafruit_SSD1306 &display,SecureStorage &eeprom)
 
   HDPrivateKey hdKey;
   String s = seedToWords(seed, 16);
+  // seedToWords() leaves a trailing space; BIP39 hashes the mnemonic
+  // verbatim, so it must go or the 12 words restore a different wallet.
+  s.trim();
   char mnem[200];
   s.toCharArray(mnem, sizeof(mnem));
   updateProgressBar(display,30);
@@ -134,6 +158,13 @@ void generateWallet(Adafruit_SSD1306 &display,SecureStorage &eeprom)
   const char *pass = "";
   hdKey.fromMnemonic(mnem, strlen(mnem), pass, 0);
   updateProgressBar(display,40);
+  display.display();
+
+  // BIP32 root for SegWit (BIP84) accounts and PSBT signing
+  HdRecord hd;
+  hdMakeRecord(hdKey, pin, hd);
+  eeprom.writeHd(hd);
+  updateProgressBar(display,50);
   display.display();
 
   HDPrivateKey btcKey  = hdKey.hardenedChild(44).hardenedChild(0).hardenedChild(0).child(0).child(0);
@@ -167,18 +198,30 @@ void generateWallet(Adafruit_SSD1306 &display,SecureStorage &eeprom)
   updateProgressBar(display,80);
   display.display();
 
-  // U2F placeholder  m/44'/99'/0'/0/0
+  // U2F  m/44'/99'/0'/0/0
   k.network = U2F;
   k.id = 3;
   k.nonce = 0;
   u2fKey.getSecret(k.privateKey.data());
   u2fKey.publicKey().sec(k.publicKey.data(), k.publicKey.size());
+
+  // FIDO2 master secret = HMAC(u2f key). Kept in clear so the security key
+  // works without the PIN; one-way, so leaking it exposes no wallet key.
+  Key fido;
+  fido.network = U2F;
+  fido.id = FIDO_KEY_SLOT;
+  fido.publicKey.fill(0);
+  const char fidoLabel[] = "Soteria FIDO2";
+  sha256Hmac((const uint8_t *)fidoLabel, strlen(fidoLabel),
+             k.privateKey.data(), k.privateKey.size(), fido.privateKey.data());
+  eeprom.storeKey(FIDO_KEY_SLOT, fido);
+
   xorKey(k, pin);
   eeprom.storeKey(3, k);
   updateProgressBar(display,90);
   display.display();
 
-  // ETH  m/44'/60'/0'/0/0  (address shown as hex of pubkey; no keccak in this build)
+  // ETH  m/44'/60'/0'/0/0
   k.network = ETH;
   k.id = 1;
   k.nonce = 0;
@@ -189,36 +232,31 @@ void generateWallet(Adafruit_SSD1306 &display,SecureStorage &eeprom)
   updateProgressBar(display,100);
   display.display();
 
-  // show and verify the 12 mnemonic words
-  for (int q = 0 ; q < 2; q++){
-    for (int i = 0; i < 12; i++)
-    {
-      display.clearDisplay();
-      display.setCursor(15, 0);
-      display.setTextSize(1);
-      if(q==0){
-        display.print("Write");
-      }else{
-        display.print("Verify");
-      }
-      display.setTextSize(2);
-      display.setCursor(0, 20);
-      display.print(i + 1);
-      display.print(":");
-      display.println(getWordsInString(s, ' ', i));
-      display.display();
-      delay(1000);
-      displayYesNo(display);
-      display.display();
-      while(!digitalRead(YES))
-      {
-        delay(300);
-      }
-    }
+  // Show the 12 words twice: once to write them down, once to check the
+  // copy. YES = next word, NO = previous word.
+  for (int step = 0; step < 24; ) {
+    int i = step % 12;
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(WHITE);
+    display.setCursor(0, 0);
+    display.print(step < 12 ? "Write down word " : "Check word ");
+    display.print(i + 1);
+    display.print("/12");
+    String word = getWordsInString(s, ' ', i);
+    word.trim();
+    display.setTextSize(2);   // 12 px per char, <= 8 letters
+    display.setCursor((display.width() - 12 * (int)word.length()) / 2, 24);
+    display.print(word);
+    displayYesNo(display);
+    display.display();
+    if (waitButton() == BTN_YES) step++;
+    else if (step > 0) step--;
   }
 
   uint16_t flag = GEN_FLAG;
   eeprom.writeFlag((unsigned char)6, flag);
+  forgetWalletAddresses();
 }
 
 void xorKey(Key &k, uint8_t *pin){
@@ -230,206 +268,394 @@ void xorKey(Key &k, uint8_t *pin){
   }
 }
 
-void askPin(Adafruit_SSD1306 &display, uint8_t *pin){
-  display.clearDisplay();
-  display.setCursor(15, 0);
-  display.setTextColor(WHITE);
-  display.println("Input pin");
-  display.display();
-  int num = analogRead(A7)/64;
-  for(char i=0; i<5;)
-  {
-    delay(300);
-    while(!digitalRead(YES)){
-      num = analogRead(A7)/64;
-      display.clearDisplay();
-       display.setTextSize(1);
-      display.setCursor(15, 0);
-      display.println("Input pin\n\n");
-      display.setTextSize(3);
-      for(char v =0; v<5;v++){
-        if(v==i){
-          display.print(num, HEX);
-        }else{display.print("*");}
-      }
-      if(digitalRead(NO)){
-        return;
-      }
-      displayYesNo(display);
-      display.display();
-      delay(300);
-    }
-    pin[i++] = num;
-    display.display();
-  }
-  for(int i=3; i>=1; i--){
-    display.setCursor(0, 0);
-    display.clearDisplay();
-    display.print(i, DEC);
-    display.display();
-    display.clearDisplay();
-    delay(500);
+bool unlockKey(Key &k, uint8_t *pin){
+  xorKey(k, pin);
+  PrivateKey pk(k.privateKey.data(), true, &Mainnet);
+  uint8_t sec[33];
+  pk.publicKey().sec(sec, sizeof(sec));
+  return memcmp(sec, k.publicKey.data(), sizeof(sec)) == 0;
+}
+
+bool loadFidoSecret(SecureStorage &eeprom, uint8_t secret[32]){
+  Key k;
+  eeprom.getKey(FIDO_KEY_SLOT, k);
+  // Erased / never-written slots read back as 0xFF and fail this check.
+  if (k.network != U2F || k.id != FIDO_KEY_SLOT) return false;
+  memcpy(secret, k.privateKey.data(), 32);
+  return true;
+}
+
+Button waitButton(){
+  buttonsArm();
+  for (;;) {
+    Button b = buttonsPoll();
+    if (b != BTN_NONE) return b;
+    delay(5);
   }
 }
+
+void showMessage(Adafruit_SSD1306 &display, const char *text, uint32_t ms){
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println(text);
+  display.display();
+  delay(ms);
+}
+
+static void showWrongPin(Adafruit_SSD1306 &display){
+  showMessage(display, "Wrong PIN!", 2000);
+}
+
+static uint32_t s_promptTimeout = 0;
+static bool s_promptTimedOut = false;
+
+void setPromptTimeout(uint32_t ms){
+  s_promptTimeout = ms;
+  s_promptTimedOut = false;   // don't report a stale timeout for the next request
+}
+
+bool promptTimedOut(){
+  return s_promptTimedOut;
+}
+
+// True (after telling the user) once a prompt started at `start` expired.
+static bool promptExpired(Adafruit_SSD1306 &display, uint32_t start){
+  if (s_promptTimeout == 0 || millis() - start < s_promptTimeout) return false;
+  s_promptTimedOut = true;
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.println("Timed out.");
+  display.println("Request cancelled.");
+  display.display();
+  delay(1500);
+  return true;
+}
+
+bool askPin(Adafruit_SSD1306 &display, uint8_t *pin){
+  s_promptTimedOut = false;
+  for (int i = 0; i < 5; i++) {
+    buttonsArm();
+    uint32_t start = millis();   // each digit gets the full timeout
+    int shown = -1;
+    for (;;) {
+      if (promptExpired(display, start)) return false;
+      int num = PIN_PLACEHOLDER_DIGIT;
+      if (num != shown) {        // redraw only when the digit changes
+        shown = num;
+        display.clearDisplay();
+        display.setTextColor(WHITE);
+        display.setTextSize(1);
+        display.setCursor(0, 0);
+        display.print("Enter PIN digit ");
+        display.print(i + 1);
+        display.print("/5");
+        display.setTextSize(3);  // 5 chars x 18 px, centred
+        display.setCursor(19, 22);
+        for (int v = 0; v < 5; v++) {
+          if (v == i) display.print(num, HEX);
+          else display.print("*");
+        }
+        displayYesNo(display);
+        display.display();
+      }
+      Button b = buttonsPoll();
+      if (b == BTN_NO) return false;
+      if (b == BTN_YES) {
+        pin[i] = (uint8_t)shown;
+        break;
+      }
+      delay(10);
+    }
+  }
+  return true;
+}
+
 boolean askYesNo(Adafruit_SSD1306 &display){
-  delay(500);
+  s_promptTimedOut = false;
   displayYesNo(display);
   display.display();
   display.clearDisplay();
   display.setCursor(0, 0);
-  while(true) {
-    if (digitalRead(NO)) {
-      return false;
-    }
-    if (digitalRead(YES)) {
-      return true;
-    }
-    delay(500);
+  buttonsArm();
+  uint32_t start = millis();
+  for (;;) {
+    Button b = buttonsPoll();
+    if (b == BTN_NO) return false;
+    if (b == BTN_YES) return true;
+    if (promptExpired(display, start)) return false;
+    delay(5);
   }
-  return true;
 }
 
-char askXorY(Adafruit_SSD1306 &display, String x, String y){
-  delay(500);
-  displayXorY(display, x, y);
-  while(true) {
-    if (digitalRead(NO)) {
-      return 'X';
-    }
-    if (digitalRead(YES)) {
-      return 'Y';
-    }
-    delay(200);
-  }
-  return 'N';
-
-}
-
-boolean signBtc(Adafruit_SSD1306 &display, String data, Key k, boolean testnet){
-  char hex[data.length()+1];
-  byte raw[data.length()/2];
-  data.toCharArray(hex, data.length()+1);
-  size_t len = fromHex(hex, raw, sizeof(raw));
-  Tx tx;
-  tx.parse(raw, len);
-
+// Ask for the PIN and decrypt k with it.
+static WalletStatus unlockWithPin(Adafruit_SSD1306 &display, Key &k){
   uint8_t pin[5];
-
-  display.clearDisplay();
-    display.setCursor(0, 0);
-    display.setTextSize(1);
-    display.println("Sign BTC Transaction?");
-  float total = 0;
-  for (int i = 0; i < tx.outputsNumber; i++) {
-    total += ((float)tx.txOuts[i].amount) / 1e8;
+  if (!askPin(display, pin)) return WALLET_REJECTED;
+  if (!unlockKey(k, pin)) {
+    showWrongPin(display);
+    return WALLET_WRONG_PIN;
   }
-  display.print("Ins:"); display.print(tx.inputsNumber);
-  display.print("-Outs:"); display.print(tx.outputsNumber);
-  display.print(" T:"); display.print(total, 4); display.println(" BTC");
-  for (int i = 0; i < tx.outputsNumber; i++) {
-    display.print(tx.txOuts[i].address(testnet ? &Testnet : &Mainnet));
-    display.print(":");
-    display.print(((float)tx.txOuts[i].amount) / 1e8, 4);
-    display.println(" BTC");
-  }
-  display.display();
-  if(askYesNo(display)){
-    askPin(display, pin);
-    xorKey(k, pin);
-    PrivateKey pk(k.privateKey.data(), true, testnet ? &Testnet : &Mainnet);
-    for(int i=0; i<tx.inputsNumber; i++){
-      Signature sig = tx.signInput(i, pk);
-      tx.txIns[i].scriptSig.push(sig);
-    }
-    Serial.println(tx);
-    return true;
-  }
-  return false;
-
+  return WALLET_OK;
 }
 
-boolean signEth(Adafruit_SSD1306 &display, String data, Key k){
-  // `data` is expected to be a 64-hex-char (32-byte) Keccak-256 hash to sign.
-  // This is the host/device split used by hardware wallets: the host builds the
-  // Ethereum transaction, computes keccak256(rlp(unsigned_tx_with_chainid)),
-  // and sends the 32-byte hash for the device to sign.
-  uint8_t hash[32];
-  size_t hlen = fromHex(data.c_str(), hash, 32);
-  if (hlen != 32) {
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.setTextSize(1);
-    display.println("Invalid ETH hash");
-    display.println("(expect 64 hex chars)");
-    display.display();
-    delay(2000);
-    return false;
-  }
-
-  // Show the hash being signed so the user can verify before confirming
-  display.clearDisplay();
-  display.setCursor(0, 0);
-  display.setTextSize(1);
-  display.println("Sign ETH hash?");
-  display.println(data.substring(0, 16));
-  display.println(data.substring(16, 32));
-  display.display();
-  if (!askYesNo(display)) return false;
-
-  // Unlock the PIN-encrypted private key
-  uint8_t pin[5];
-  askPin(display, pin);
-  xorKey(k, pin);
-
-  // Sign the Keccak-256 hash with ECDSA secp256k1
+// ECDSA secp256k1 (RFC 6979) over hash; sig = r(32) | s(32) | recovery id
+static void signHash(const Key &k, const uint8_t hash[32], uint8_t sig[65]){
   PrivateKey pk(k.privateKey.data(), true, &Mainnet);
-  Signature sig = pk.sign(hash);
+  pk.sign(hash).bin(sig, 65);
+}
 
-  // Signature::bin writes <r[32]><s[32]><index>
-  uint8_t sigBin[66];
-  sig.bin(sigBin, 66);
-  uint8_t *r = sigBin;
-  uint8_t *s = sigBin + 32;
-
-  // EIP-155 replay-protection v byte (chainId=1 mainnet => 27/28 base;
-  // host applies the chainId offset when assembling the signed tx)
-  uint8_t v = 27;
-
-  // Output components over Serial so the host can assemble the signed tx
-  Serial.println("ETH SIGNED");
-  Serial.println("R: " + toHex(r, 32));
-  Serial.println("S: " + toHex(s, 32));
-  Serial.println("V: " + String(v));
-
-  // Show R and S as QR codes on screen
+static void beginScreen(Adafruit_SSD1306 &display, const char *title){
   display.clearDisplay();
   display.setCursor(0, 0);
   display.setTextSize(1);
-  display.println("ETH Signed");
-  display.println("R/S via QR");
-  display.display();
-
-  QRCode qrcodeR;
-  uint8_t qrcodeDataR[qrcode_getBufferSize(3)];
-  String rStr = String("R:") + toHex(r, 32);
-  qrcode_initText(&qrcodeR, qrcodeDataR, 3, 0, rStr.c_str());
-  displayQrCode(display, qrcodeR, 0);
-
-  QRCode qrcodeS;
-  uint8_t qrcodeDataS[qrcode_getBufferSize(3)];
-  String sStr = String("S:") + toHex(s, 32);
-  qrcode_initText(&qrcodeS, qrcodeDataS, 3, 0, sStr.c_str());
-  displayQrCode(display, qrcodeS, 64);
-
-  display.display();
-  delay(4000);
-  while (!digitalRead(YES)) {
-    delay(200);
-  }
-  return true;
+  display.setTextColor(WHITE);
+  display.println(title);
 }
 
-void eraseDevice(Adafruit_SSD1306 &display, SecureStorage &eeprom){
+static void showSigned(Adafruit_SSD1306 &display){
+  beginScreen(display, "Signed.");
+  display.display();
+  delay(800);
+}
+
+// Exact BTC amount from satoshis ("0.00012345"); floats would round.
+static void printBtc(Adafruit_SSD1306 &display, uint64_t sats){
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%lu.%08lu", (unsigned long)(sats / 100000000ULL),
+           (unsigned long)(sats % 100000000ULL));
+  display.print(buf);
+}
+
+// Label line, then the EIP-55 address on exactly two 21-char lines.
+static void printEthAddr(Adafruit_SSD1306 &display, const char *label, const uint8_t addr[20]){
+  char buf[43];
+  display.println(label);
+  ethAddressToString(addr, buf);
+  display.println(buf);
+}
+
+WalletStatus signBtcTx(Adafruit_SSD1306 &display, const uint8_t *raw, size_t len, Key k,
+                       bool testnet, uint8_t *out, size_t cap, size_t *outLen){
+  Tx tx;
+  // uBitcoin's parsers are not safe on malformed input: check structure first
+  if (!btcTxWellFormed(raw, len)) return WALLET_INVALID;
+  if (tx.parse(raw, len) != len || tx.inputsNumber == 0) return WALLET_INVALID;
+
+  // One screen per output: the full address must be checkable.
+  uint64_t total = 0;
+  for (int i = 0; i < tx.outputsNumber; i++) {
+    char title[24];
+    snprintf(title, sizeof(title), "BTC output %d/%d", i + 1, (int)tx.outputsNumber);
+    beginScreen(display, title);
+    String addr = tx.txOuts[i].address(testnet ? &Testnet : &Mainnet);
+    display.println(addr.length() ? addr : String("(non-standard script)"));
+    printBtc(display, tx.txOuts[i].amount);
+    display.println(" BTC");
+    display.display();
+    if (!askYesNo(display)) return WALLET_REJECTED;
+    total += tx.txOuts[i].amount;
+  }
+
+  // Legacy transactions do not commit to input amounts, so the fee is unknown.
+  beginScreen(display, "Sign BTC tx?");
+  display.print(tx.inputsNumber); display.println(" input(s)");
+  display.print("Total out: "); printBtc(display, total); display.println();
+  display.println("Fee: unknown");
+  display.display();
+  if (!askYesNo(display)) return WALLET_REJECTED;
+
+  WalletStatus st = unlockWithPin(display, k);
+  if (st != WALLET_OK) return st;
+  PrivateKey pk(k.privateKey.data(), true, testnet ? &Testnet : &Mainnet);
+  for(int i=0; i<tx.inputsNumber; i++){
+    // signInput() sets scriptSig to <sig> <pubkey> (P2PKH)
+    tx.signInput(i, pk);
+  }
+  if (tx.length() > cap) return WALLET_TOO_LARGE;
+  *outLen = tx.serialize(out, cap);
+  showSigned(display);
+  return WALLET_OK;
+}
+
+WalletStatus signEthHash(Adafruit_SSD1306 &display, const uint8_t hash[32], Key k, uint8_t sig[65]){
+  // Blind signing: nothing but the hash can be shown, so show all of it.
+  beginScreen(display, "Sign ETH hash? BLIND");
+  display.println(toHex(hash, 32));
+  display.display();
+  if (!askYesNo(display)) return WALLET_REJECTED;
+
+  WalletStatus st = unlockWithPin(display, k);
+  if (st != WALLET_OK) return st;
+  signHash(k, hash, sig);
+  showSigned(display);
+  return WALLET_OK;
+}
+
+WalletStatus signEthTx(Adafruit_SSD1306 &display, const uint8_t *raw, size_t len, Key k,
+                       uint8_t sig[65], uint8_t *out, size_t cap, size_t *outLen){
+  EthTx tx;
+  if (!ethTxParse(raw, len, tx)) return WALLET_INVALID;
+  uint8_t fee[32];
+  if (!ethTxMaxFee(tx, fee)) return WALLET_INVALID;
+  char buf[84];
+
+  // Chain name and native coin from the table; unknown chains by id.
+  const EthChain *chain = ethChainLookup(tx.chainId);
+  const char *sym = chain ? chain->symbol : "(native)";
+  char title[22];
+  if (chain) {
+    snprintf(title, sizeof(title), "%s", chain->name);
+  } else {
+    uint8_t chainBe[8];
+    for (int i = 0; i < 8; i++) chainBe[i] = (uint8_t)(tx.chainId >> (56 - 8 * i));
+    ethFormatUnits(chainBe, 8, 0, buf, sizeof(buf));
+    snprintf(title, sizeof(title), "Chain %s", buf);
+  }
+  bool hasValue = false;
+  for (int i = 0; i < tx.valueLen; i++) hasValue |= tx.value[i] != 0;
+  ethFormatUnits(tx.value, tx.valueLen, 18, buf, sizeof(buf));
+  String value = String(buf) + " " + sym;
+
+  Erc20Call call;
+  if (ethDecodeErc20(tx, call)) {
+    // Calldata has the shape of an ERC-20 call; amounts are in the
+    // token's base units (decimals are unknown to the device).
+    beginScreen(display, title);
+    display.println(call.kind == ERC20_APPROVE ? "TOKEN APPROVAL" : "ERC-20 token transfer");
+    printEthAddr(display, "Token contract:", tx.to);
+    if (hasValue) display.println("+ " + value);
+    display.display();
+    if (!askYesNo(display)) return WALLET_REJECTED;
+
+    if (call.kind == ERC20_TRANSFER_FROM) {
+      beginScreen(display, "Token transfer");
+      printEthAddr(display, "From:", call.from);
+      display.display();
+      if (!askYesNo(display)) return WALLET_REJECTED;
+    }
+    beginScreen(display, call.kind == ERC20_APPROVE ? "Allow spender" : "Token transfer");
+    printEthAddr(display, call.kind == ERC20_APPROVE ? "Spender:" : "To:", call.to);
+    if (call.kind == ERC20_APPROVE && ethIsMaxUint256(call.amount)) {
+      display.println("Amount: UNLIMITED!");
+    } else {
+      ethFormatUnits(call.amount, 32, 0, buf, sizeof(buf));
+      display.println("Amount (base units):");
+      display.println(buf);
+    }
+    display.display();
+    if (!askYesNo(display)) return WALLET_REJECTED;
+  } else {
+    beginScreen(display, title);
+    if (tx.dataLen) display.println("CONTRACT CALL");
+    if (tx.to) printEthAddr(display, tx.dataLen ? "Contract:" : "To:", tx.to);
+    else display.println("Deploy new contract");
+    display.println("Value:");
+    display.println(value);
+    display.display();
+    if (!askYesNo(display)) return WALLET_REJECTED;
+  }
+
+  // Fee screen
+  beginScreen(display, tx.type == 2 ? "Fee (EIP-1559)" : "Fee (legacy)");
+  display.println("Max fee:");
+  ethFormatUnits(fee, 32, 18, buf, sizeof(buf));
+  display.print(buf);
+  display.print(" ");
+  display.println(sym);
+  if (tx.dataLen) {
+    display.print("Data: ");
+    display.print((unsigned long)tx.dataLen);
+    display.println(" bytes");
+  }
+  display.display();
+  if (!askYesNo(display)) return WALLET_REJECTED;
+
+  WalletStatus st = unlockWithPin(display, k);
+  if (st != WALLET_OK) return st;
+  uint8_t hash[32];
+  keccak256(raw, len, hash);   // both formats sign keccak256(unsigned bytes)
+  signHash(k, hash, sig);
+  *outLen = ethTxEncodeSigned(tx, sig, out, cap);
+  if (*outLen == 0) return WALLET_TOO_LARGE;
+  showSigned(display);
+  return WALLET_OK;
+}
+
+WalletStatus signEthMessage(Adafruit_SSD1306 &display, const uint8_t *msg, size_t len, Key k,
+                            uint8_t sig[65]){
+  beginScreen(display, "Sign ETH message?");
+  for (size_t i = 0; i < len && i < 100; i++) {
+    uint8_t c = msg[i];
+    display.print((c >= 32 && c < 127) ? (char)c : '.');
+  }
+  if (len > 100) display.print("...");
+  display.display();
+  if (!askYesNo(display)) return WALLET_REJECTED;
+
+  WalletStatus st = unlockWithPin(display, k);
+  if (st != WALLET_OK) return st;
+  uint8_t hash[32];
+  ethPersonalMessageHash(msg, len, hash);
+  signHash(k, hash, sig);
+  showSigned(display);
+  return WALLET_OK;
+}
+
+WalletStatus signPsbt(Adafruit_SSD1306 &display, PSBT &psbt, const HdRecord &rec, bool testnet,
+                      const PsbtSummary &sum, uint8_t *signedInputs){
+  const char *unit = testnet ? " tBTC" : " BTC";
+
+  // One screen per payment: every address must be checkable. Outputs
+  // that provably return to this wallet (change) are only totalled.
+  int payments = 0, shown = 0;
+  for (size_t i = 0; i < psbt.tx.outputsNumber; i++) {
+    if (!((sum.ownOutputs >> i) & 1)) payments++;
+  }
+  char addr[96];
+  for (size_t i = 0; i < psbt.tx.outputsNumber; i++) {
+    if ((sum.ownOutputs >> i) & 1) continue;
+    const TxOut &out = psbt.tx.txOuts[i];
+    char title[22];
+    snprintf(title, sizeof(title), "Send %d/%d", ++shown, payments);
+    beginScreen(display, title);
+    if (btcScriptAddress(out.scriptPubkey, testnet, addr, sizeof(addr))) display.println(addr);
+    else display.println("OP_RETURN (data)");
+    printBtc(display, out.amount);
+    display.println(unit);
+    display.display();
+    if (!askYesNo(display)) return WALLET_REJECTED;
+  }
+
+  beginScreen(display, testnet ? "Confirm TESTNET tx" : "Confirm transaction");
+  display.print("Send:   "); printBtc(display, sum.sendTotal); display.println();
+  display.print("Fee:    "); printBtc(display, sum.fee); display.println();
+  if (sum.ownTotal) {
+    display.print("Change: "); printBtc(display, sum.ownTotal); display.println();
+  }
+  uint64_t moved = sum.sendTotal ? sum.sendTotal : sum.ownTotal;
+  if (sum.fee * 10 > moved) display.println("WARNING: fee > 10%!");
+  display.display();
+  if (!askYesNo(display)) return WALLET_REJECTED;
+
+  uint8_t pin[5];
+  if (!askPin(display, pin)) return WALLET_REJECTED;
+  HDPrivateKey root;
+  if (!hdUnlock(rec, pin, root)) {
+    showWrongPin(display);
+    return WALLET_WRONG_PIN;
+  }
+  showMessage(display, "Signing...", 0);
+  *signedInputs = psbtSign(psbt, root);
+  if (*signedInputs == 0) return WALLET_INVALID;
+  showSigned(display);
+  return WALLET_OK;
+}
+
+bool eraseDevice(Adafruit_SSD1306 &display, SecureStorage &eeprom){
   display.clearDisplay();
   display.setCursor(0, 0);
   display.setTextSize(2);
@@ -452,12 +678,14 @@ void eraseDevice(Adafruit_SSD1306 &display, SecureStorage &eeprom){
       {
         eeprom.storeKey(i, k);
       }
-      char name[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-      eeprom.writeName(6, name);
+      eeprom.writeName(6, "");
+      eeprom.eraseHd();
+      forgetWalletAddresses();
       display.println("DONE!");
       display.display();
       delay(1000);
+      return true;
     }
   }
-
+  return false;
 }

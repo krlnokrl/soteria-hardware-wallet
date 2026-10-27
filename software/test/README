@@ -1,11 +1,41 @@
+Tests
+=====
 
-This directory is intended for PlatformIO Test Runner and project tests.
+Sanity tests for the core functionality, run by CI (.github/workflows/ci.yml)
+on every push and pull request:
 
-Unit Testing is a software testing method by which individual units of
-source code, sets of one or more MCU program modules together with associated
-control data, usage procedures, and operating procedures, are tested to
-determine whether they are fit for use. Unit testing finds problems early
-in the development cycle.
+  pio run                  build the firmware for all boards
+  pio test -e native       host tests of the firmware code (below)
+  cd web-client && npm ci && npm test
+                           web client (chain.js and the page in jsdom)
 
-More information about PlatformIO Unit Testing:
-- https://docs.platformio.org/en/latest/advanced/unit-testing/index.html
+Host tests (PlatformIO `native` environment, needs gcc/g++ on the PC)
+--------------------------------------------------------------------
+
+The hardware-independent firmware sources (src/crypto, src/u2f.cpp,
+src/buttons.cpp, src/utils.cpp, SecureStorage) are compiled for the PC and
+linked against stand-ins for Arduino, the I2C EEPROM, USB HID and the OLED
+(test/libs/HostStubs). Expected values come from independent sources: the
+BIP39/BIP44/BIP84 test vectors, embit and eth-account.
+
+  test_wallet   BIP39 words; BIP84 SegWit and BIP44 legacy/ETH addresses of
+                the "abandon ... about" test mnemonic; output descriptor;
+                PIN-encrypted root; Ethereum transaction signature; ERC-20
+                recognition; PSBT review, signing (signature verified) and
+                merging; malformed PSBTs refused.
+  test_u2f      FIDO2 over emulated USB HID: register, sign in, verify the
+                attestation and assertion signatures, sign in again after a
+                reboot, NO button denies, wrong site / no wallet refused.
+
+Windows has no gcc by default; PlatformIO's MinGW toolchain works:
+
+  pio pkg install -g -t platformio/toolchain-gccmingw32
+  set PATH=%USERPROFILE%\.platformio\packages\toolchain-gccmingw32\bin;%PATH%
+  pio test -e native
+
+Web client fixtures
+-------------------
+
+web-client/test/fixtures.json holds reference vectors computed with rlp,
+eth_abi and embit. Regenerate them with test/tools/make_web_fixtures.py
+(see the instructions in that file).

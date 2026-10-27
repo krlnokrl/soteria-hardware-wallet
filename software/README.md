@@ -27,7 +27,7 @@ In other words, it is trying to behave like a lightweight hardware wallet protot
   - FIDO U2F
 - QR code display for addresses
 - OLED-based user prompts and menu flow
-- USB serial interface for interactive wallet actions
+- JSON-lines host protocol over USB serial (always on; see `web-client/README.md`)
 - EEPROM-backed wallet state and flags
 
 ## Code structure
@@ -41,7 +41,7 @@ This is the main application loop. It is responsible for:
 - checking whether a wallet already exists
 - prompting the user to generate one if none is present
 - showing wallet addresses in a rotating display loop
-- handling a USB console flow for commands like ADDRESS, NAME, ERASE, and SIGN
+- servicing the FIDO2 (USB HID) and host protocol (USB serial) interfaces from every UI loop
 
 This is the entry point that coordinates the visible device behavior.
 
@@ -80,15 +80,17 @@ These files handle all of the OLED drawing helpers used by the menu and wallet U
 
 They keep the display code isolated from the crypto logic so the device UI remains easier to manage.
 
-### src/menu.cpp
-This file contains the menu rendering functions used by the wallet screen, such as:
+### src/protocol.h and src/protocol.cpp
+The host protocol: reads JSON request lines from USB serial, dispatches commands (info, addresses, signing, rename, erase), emits `confirm_on_device` events and writes JSON replies.
 
-- a wallet banner
-- address view rendering
-- USB menu views
-- command list display helpers
+### src/crypto/ethtx.h and src/crypto/ethtx.cpp
+Ethereum transaction support: RLP parsing of unsigned EIP-155 / EIP-1559 transactions for on-device display, ERC-20 call recognition, the EVM chain name/symbol table, signed re-encoding, fee and unit formatting, EIP-191 message hashing.
 
-It is a presentation layer for the embedded UI.
+### src/crypto/btchd.h and src/crypto/btchd.cpp
+Bitcoin HD wallet: BIP84 (native SegWit) accounts and addresses, output descriptors, bech32/bech32m address encoding, strict structural validation of host transactions and PSBTs, PSBT review (fee, change detection) and signing.
+
+### src/buttons.h and src/buttons.cpp
+Debounced, edge-triggered handling of the YES/NO buttons. A press only counts if it started after the current prompt appeared, so a button held from the previous screen never answers the next one.
 
 ### lib/bip39/
 This is the bundled mnemonic wordlist and BIP39 implementation used by the wallet. It provides the word list and helper code required to generate and verify mnemonic phrases.
@@ -112,7 +114,34 @@ The project currently targets embedded SAM boards and includes the required libr
 5. Hierarchical derivation creates keys for BTC, ETH, and testnet variants.
 6. The resulting keys are XOR-masked and stored in EEPROM.
 7. The display rotates through address/QR views.
-8. Pressing the relevant button can trigger a USB session to sign or query the wallet state.
+8. The host can query and request signatures at any time over the JSON protocol; anything sensitive is confirmed on the device (YES on the address screen skips to the next address).
+
+## Bitcoin: native SegWit and PSBT
+
+Wallets created with this firmware also store the BIP32 root (XOR-encrypted with the PIN, like the other keys) and the BIP84 account xpubs. The device then shows native SegWit (`bc1q…`) receive addresses, exports output descriptors, and signs PSBTs: every payment address and amount is shown on its own screen, followed by a summary with the fee and the change, which is only recognised as change if its derivation path, key and script all belong to this wallet. See `web-client/README.md` for the workflow with Sparrow / Bitcoin Core.
+
+Host-supplied transactions and PSBTs are structurally validated before uBitcoin parses them: uBitcoin's PSBT parser corrupts memory on some malformed inputs (in fuzzing, 14 % of randomly corrupted PSBTs crashed it; none do after validation).
+
+Wallets created before SegWit support keep working with legacy addresses (`NO_SEGWIT` for the new commands) until they are erased and regenerated.
+
+## Device UI
+
+- Main screen: wallet name, coin and address on the left, QR code on the right. **YES** = next coin (BTC, BTC testnet, ETH/EVM), **NO** = toggle a large view with the address in groups of 4 characters for comparison.
+- After 1 minute untouched the coins rotate; after 3 minutes a screen saver hides the addresses (privacy, OLED burn-in). Any button wakes it.
+- Backup words: one word per screen, YES = next, NO = previous; the list is shown twice (write down, then check).
+- Prompts requested over USB (signing, address access, FIDO2) give up after 60 seconds without an answer.
+
+## FIDO2 security key (2FA)
+
+On the `adafruit_feather_m0` build the device also enumerates as a USB HID FIDO2 (CTAP2) authenticator, usable as a second factor in browsers via WebAuthn:
+
+- Every registration and sign-in shows the site on the display and must be confirmed with **Yes** (No denies, 60 s timeout).
+- Credentials are non-resident and stateless: the credential id the site stores is a nonce plus an HMAC tag, and the P-256 key is re-derived from a master secret. Credentials therefore survive power cycles and there is no slot limit, but passwordless "passkey" logins (resident keys) are not supported.
+- The master secret is derived from the wallet seed when a wallet is generated and stored in EEPROM key slot 4 without PIN encryption, so the key works without the PIN. The signature counter is persisted in EEPROM.
+- Storage is constant: one 80-byte key slot plus a 4-byte counter, however many sites are registered. Each registration and each confirmed login rewrites the counter (4 bytes); silent browser probes do not. Erasing or regenerating the wallet creates a new master secret, which invalidates every existing registration, so keep the sites' backup codes.
+- Only CTAP2 is implemented (no legacy CTAP1/U2F), there is no PIN/UV, and attestation is self-attestation.
+
+Wallets generated with firmware before this change must be erased and regenerated: their EEPROM key data is corrupt (page-wrap bug), their 12 words did not restore the same keys in other BIP39 wallets, and they have no FIDO2 secret.
 
 ## Build and run
 
@@ -148,6 +177,6 @@ The code includes the core ideas behind a hardware wallet, but it should not be 
 - wallet logic: src/wallet.cpp
 - configuration: platformio.ini
 - mnemonic support: lib/bip39/
-- tests: test/
+- tests: test/ (firmware host tests, `pio test -e native`) and web-client/test (`npm test`); see test/README
 
 If you are exploring the project, start with [src/main.cpp](src/main.cpp), then read [src/wallet.cpp](src/wallet.cpp), and finally review the UI helpers in [src/display/display_fx.cpp](src/display/display_fx.cpp).

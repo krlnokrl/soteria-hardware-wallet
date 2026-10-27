@@ -31,8 +31,11 @@ static char nibbleToHex(uint8_t n) {
     return n < 10 ? char('0' + n) : char('a' + n - 10);
 }
 
-/* EIP-55 checksum: uppercase hex chars where corresponding keccak256 hash nibble >= 8 */
-static void eip55Checksum(const char* addr40, const uint8_t hash[32], char out[43]) {
+/* EIP-55 checksum: uppercase hex chars where the matching nibble of
+   keccak256(lowercase hex address as ASCII) is >= 8 */
+static void eip55Checksum(const char* addr40, char out[43]) {
+    uint8_t hash[32];
+    keccak256((const uint8_t*)addr40, 40, hash);
     out[0] = '0';
     out[1] = 'x';
     for (int i = 0; i < 40; i++) {
@@ -53,9 +56,10 @@ size_t ethAddressFromPubkey(const uint8_t pubkey[65], char out[43]) {
     uint8_t hash[32];
     keccak256(pubkey + 1, 64, hash);          // Keccak-256 of x||y (uncompressed, without 0x04 prefix)
 
-    uint8_t addr[20];
-    memcpy(addr, hash + 12, 20);              // last 20 bytes of the hash
+    return ethAddressToString(hash + 12, out); // last 20 bytes of the hash
+}
 
+size_t ethAddressToString(const uint8_t addr[20], char out[43]) {
     char addr40[41];
     for (int i = 0; i < 20; i++) {
         addr40[2 * i] = nibbleToHex(addr[i] >> 4);
@@ -63,6 +67,6 @@ size_t ethAddressFromPubkey(const uint8_t pubkey[65], char out[43]) {
     }
     addr40[40] = 0;
 
-    eip55Checksum(addr40, hash, out);
+    eip55Checksum(addr40, out);
     return 42;
 }

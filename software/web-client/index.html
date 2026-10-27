@@ -3,82 +3,219 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Soteria Wallet – Debug Client</title>
+  <title>Soteria Wallet – Client</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <header>
     <h1>Soteria Wallet</h1>
-    <p>Hardware wallet debug / test client</p>
+    <p>Hardware wallet client (Web Serial, JSON protocol v1)</p>
   </header>
 
-  <section id="status-panel">
-    <div class="panel">
-      <h2>Connection</h2>
-      <button id="connect-btn">Connect</button>
-      <div id="status-indicator" class="indicator disconnected">
-        <span class="dot"></span>
-        <span id="status-text">Disconnected</span>
+  <div id="confirm-banner" class="banner" hidden>
+    Confirm on the device: <span id="confirm-what"></span>
+  </div>
+
+  <main>
+    <section>
+      <div class="panel">
+        <h2>Connection</h2>
+        <div class="cmd-row">
+          <button id="connect-btn">Connect</button>
+          <div id="status-indicator" class="indicator disconnected">
+            <span class="dot"></span>
+            <span id="status-text">Disconnected</span>
+          </div>
+          <span id="port-info"></span>
+        </div>
+        <dl id="device-info" class="kv"></dl>
+        <button id="info-btn" class="cmd-btn needs-conn" disabled>Refresh info</button>
       </div>
-      <div id="port-info" style="margin-top:6px; font-size:0.9rem; color:#888;"></div>
-    </div>
-  </section>
+    </section>
 
-  <section id="commands-panel">
-    <div class="panel">
-      <h2>Device Commands</h2>
+    <section>
+      <div class="panel">
+        <h2>Wallet</h2>
+        <p class="hint">The first address/public-key request after power-on must be allowed on the device.</p>
+        <div class="cmd-row">
+          <button id="addresses-btn" class="cmd-btn needs-conn" disabled>Get addresses</button>
+          <button id="xpubs-btn" class="cmd-btn needs-conn" disabled>Get xpubs / descriptors</button>
+          <button id="pubkeys-btn" class="cmd-btn needs-conn" disabled>Get public keys</button>
+        </div>
+        <dl id="wallet-out" class="kv"></dl>
+        <p class="hint">Import the <em>receive</em> and <em>change</em> descriptors as a watch-only wallet
+          in Sparrow, Electrum or Bitcoin Core; it builds PSBTs that this device signs.</p>
 
-      <div class="cmd-row">
-        <button class="cmd-btn" data-cmd="ADDRESS">ADDRESS</button>
-        <button class="cmd-btn" data-cmd="ERASE">ERASE</button>
+        <div class="cmd-row">
+          <label for="verify-coin">Verify</label>
+          <select id="verify-coin">
+            <option value="btc">BTC</option>
+            <option value="btc_testnet">BTC testnet</option>
+            <option value="eth">ETH / EVM</option>
+          </select>
+          <input type="number" id="verify-index" min="0" value="0" title="address index" />
+          <label class="inline"><input type="checkbox" id="verify-change" /> change</label>
+          <button id="verify-btn" class="cmd-btn needs-conn" disabled>Show on device</button>
+        </div>
+
+        <div class="cmd-row">
+          <label for="name-input">Name</label>
+          <input type="text" id="name-input" placeholder="1-8 chars, no spaces" maxlength="8" />
+          <button id="name-btn" class="cmd-btn needs-conn" disabled>Set name</button>
+        </div>
+        <div class="cmd-row">
+          <label>Danger</label>
+          <button id="erase-btn" class="danger-btn needs-conn" disabled>Erase wallet…</button>
+        </div>
       </div>
+    </section>
 
-      <div class="cmd-row">
-        <label>NAME</label>
-        <input type="text" id="name-input" placeholder="wallet name" maxlength="8" />
-        <button class="cmd-btn" data-cmd="NAME" data-target="name-input">SET NAME</button>
+    <section>
+      <div class="panel">
+        <h2>Sign</h2>
+
+        <h3>Bitcoin PSBT (native SegWit)</h3>
+        <p class="hint">Unsigned PSBT (base64) from your watch-only wallet. The device shows every
+          payment address and amount, the fee and the change, and returns the PSBT with its
+          signatures added; load it back into the wallet to finalize and broadcast.</p>
+        <p class="hint">Sparrow: <em>Finalize Transaction for Signing</em>, then export the PSBT (not the raw
+          transaction hex): <em>Save Transaction</em> gives a .psbt file for the button below, or copy it as Base64.
+          Tick <em>testnet</em> for testnet4 / testnet3 / signet wallets.</p>
+        <textarea id="psbt-input" rows="4" placeholder="PSBT as base64 (cHNidP8…) or hex (70736274ff…)"></textarea>
+        <div class="cmd-row">
+          <label class="inline">Load .psbt file <input type="file" id="psbt-file" accept=".psbt,.txt" /></label>
+          <label class="inline"><input type="checkbox" id="psbt-testnet" /> testnet</label>
+          <button id="psbt-btn" class="sign-btn needs-conn" disabled>Sign PSBT</button>
+        </div>
+
+        <h3>Ethereum transaction</h3>
+        <p class="hint">Unsigned serialized transaction: EIP-1559 (<code>0x02…</code>) or legacy with
+          EIP-155 chain id, on any EVM chain (Ethereum, BNB Chain, Polygon, testnets…). The device
+          shows chain, recipient, value and maximum fee &ndash; for ERC-20 transfers/approvals the
+          token, recipient/spender and amount &ndash; and returns the signed transaction.</p>
+        <textarea id="ethtx-input" rows="3" placeholder="02f8…"></textarea>
+        <button id="ethtx-btn" class="sign-btn eth needs-conn" disabled>Sign ETH transaction</button>
+
+        <h3>Ethereum message (personal_sign)</h3>
+        <textarea id="ethmsg-input" rows="2" placeholder="text to sign"></textarea>
+        <button id="ethmsg-btn" class="sign-btn eth needs-conn" disabled>Sign message</button>
+
+        <h3>Bitcoin raw transaction (legacy P2PKH addresses)</h3>
+        <textarea id="btc-input" rows="3" placeholder="unsigned raw transaction hex"></textarea>
+        <div class="cmd-row">
+          <label><input type="checkbox" id="btc-testnet" /> testnet</label>
+          <button id="btc-btn" class="sign-btn needs-conn" disabled>Sign BTC transaction</button>
+        </div>
+
+        <details>
+          <summary>Blind-sign a 32-byte hash (advanced)</summary>
+          <p class="hint warn">The device cannot show what a raw hash authorizes. Prefer
+            “Sign ETH transaction”.</p>
+          <input type="text" id="ethhash-input" placeholder="64 hex chars" maxlength="66" />
+          <button id="ethhash-btn" class="sign-btn eth needs-conn" disabled>Sign hash</button>
+        </details>
+
+        <h3>Result</h3>
+        <pre id="sign-out" class="output">–</pre>
+        <button id="copy-btn" class="ghost-btn">Copy result</button>
       </div>
+    </section>
 
-      <div class="cmd-row">
-        <label>Custom</label>
-        <input type="text" id="custom-input" placeholder="raw command" />
-        <button class="cmd-btn" data-cmd="CUSTOM" data-target="custom-input">SEND</button>
+    <section>
+      <div class="panel">
+        <h2>Build &amp; send</h2>
+
+        <h3>Ethereum / EVM transfer</h3>
+        <p class="hint">Builds the unsigned transaction from a public RPC node (nonce, fees, gas),
+          has the device sign it and broadcasts the result. Use a testnet first.</p>
+        <div class="cmd-row">
+          <label for="evm-net">Network</label>
+          <select id="evm-net"></select>
+        </div>
+        <div class="cmd-row">
+          <label for="evm-rpc">RPC URL</label>
+          <input type="text" id="evm-rpc" />
+        </div>
+        <div class="cmd-row">
+          <label for="evm-from">From</label>
+          <input type="text" id="evm-from" placeholder="device ETH address" />
+          <button id="evm-from-btn" class="cmd-btn needs-conn" disabled>Use device address</button>
+        </div>
+        <div class="cmd-row">
+          <label for="evm-to">To</label>
+          <input type="text" id="evm-to" placeholder="0x…" />
+        </div>
+        <div class="cmd-row">
+          <label for="evm-amount">Amount</label>
+          <input type="text" id="evm-amount" placeholder="e.g. 0.01" />
+          <span id="evm-unit" class="hint"></span>
+        </div>
+        <div class="cmd-row">
+          <label for="evm-token">Token</label>
+          <input type="text" id="evm-token" placeholder="optional ERC-20 contract 0x…" />
+          <button id="evm-token-btn" class="cmd-btn">Look up</button>
+        </div>
+        <div class="cmd-row">
+          <button id="evm-prepare" class="cmd-btn">1. Prepare</button>
+          <button id="evm-sign" class="sign-btn eth" data-manual disabled>2. Sign on device</button>
+          <button id="evm-send" class="danger-btn" data-manual disabled>3. Broadcast</button>
+        </div>
+        <pre id="evm-out" class="output">–</pre>
+
+        <h3>Bitcoin: finalize &amp; broadcast</h3>
+        <p class="hint">Create the unsigned PSBT in a watch-only wallet (see below), sign it in
+          <em>Sign → Bitcoin PSBT</em>, then finalize and broadcast it here &ndash; or load the signed
+          PSBT back into the wallet instead.</p>
+        <div class="cmd-row">
+          <label for="btc-net">Network</label>
+          <select id="btc-net">
+            <option value="mainnet">Bitcoin mainnet</option>
+            <option value="testnet4">Testnet4</option>
+            <option value="testnet3">Testnet3</option>
+            <option value="signet">Signet</option>
+          </select>
+        </div>
+        <textarea id="btc-signed" rows="3" placeholder="signed PSBT (base64 or hex) – filled in after signing"></textarea>
+        <div class="cmd-row">
+          <label class="inline">Load .psbt file <input type="file" id="btc-file" accept=".psbt,.txt" /></label>
+        </div>
+        <div class="cmd-row">
+          <button id="btc-finalize" class="cmd-btn">1. Finalize</button>
+          <button id="btc-send" class="danger-btn" data-manual disabled>2. Broadcast</button>
+        </div>
+        <pre id="btc-out" class="output">–</pre>
+
+        <h3>Tools that work with this device</h3>
+        <ul class="hint links">
+          <li>Bitcoin watch-only wallets that create PSBTs from the descriptors (<em>Get xpubs</em>):
+            <a href="https://sparrowwallet.com" target="_blank" rel="noopener">Sparrow</a> (desktop, recommended),
+            <a href="https://electrum.org" target="_blank" rel="noopener">Electrum</a>,
+            <a href="https://bitcoincore.org" target="_blank" rel="noopener">Bitcoin Core</a> (<code>importdescriptors</code>, <code>walletcreatefundedpsbt</code>),
+            <a href="https://bluewallet.io" target="_blank" rel="noopener">BlueWallet</a> (mobile).
+            Prefer these over websites: a watch-only xpub reveals your whole address history to whoever sees it.</li>
+          <li>Broadcast elsewhere: <a href="https://mempool.space/tx/push" target="_blank" rel="noopener">mempool.space</a> (Bitcoin),
+            <a href="https://etherscan.io/pushTx" target="_blank" rel="noopener">Etherscan</a> (Ethereum; other chains' explorers have the same page).</li>
+          <li>Ethereum: any tool that outputs an <em>unsigned serialized</em> transaction can be used with
+            <em>Sign → Ethereum transaction</em>. The device returns the complete signed transaction (no signature
+            to append by hand); publish it with step 3 above, an explorer's broadcast page or Foundry's <code>cast publish</code>.</li>
+        </ul>
       </div>
-    </div>
-  </section>
+    </section>
 
-  <section id="sign-panel">
-    <div class="panel">
-      <h2>Sign Transaction</h2>
-      <p class="hint">Paste a hex string. For ETH, provide the 32-byte (64-char) Keccak-256 hash to sign.</p>
-
-      <div class="sign-row">
-        <button class="sign-btn" data-network="BTC">Sign BTC</button>
-        <input type="text" id="btc-input" placeholder="BTC tx hex" />
+    <section>
+      <div class="panel">
+        <h2>Console</h2>
+        <div id="terminal" class="terminal"></div>
+        <div class="cmd-row">
+          <input type="text" id="raw-input" placeholder='{"cmd":"help"}  or a text command like INFO' />
+          <button id="raw-btn" class="cmd-btn needs-conn" disabled>Send</button>
+          <button id="clear-btn" class="ghost-btn">Clear log</button>
+        </div>
       </div>
+    </section>
+  </main>
 
-      <div class="sign-row">
-        <button class="sign-btn" data-network="BTCT">Sign BTC Testnet</button>
-        <input type="text" id="btct-input" placeholder="BTC testnet tx hex" />
-      </div>
-
-      <div class="sign-row">
-        <button class="sign-btn" data-network="ETH">Sign ETH hash</button>
-        <input type="text" id="eth-input" placeholder="64 hex chars (keccak256 hash)" maxlength="64" />
-      </div>
-    </div>
-  </section>
-
-  <section id="terminal-panel">
-    <div class="panel">
-      <h2>Serial Log</h2>
-      <div id="terminal" class="terminal"></div>
-      <div style="margin-top:6px;">
-        <button id="clear-btn" class="ghost-btn">Clear log</button>
-      </div>
-    </div>
-  </section>
-
+  <script src="chain.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
