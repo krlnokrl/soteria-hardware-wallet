@@ -7,6 +7,7 @@
 
 size_t fromHex(const char* hex, uint8_t* data, size_t maxLen) {
     size_t len = strlen(hex);
+	if (len % 2 != 0) return 0;
     size_t outLen = 0;
     for (size_t i = 0; i < len && outLen < maxLen; i += 2) {
         char high = hex[i];

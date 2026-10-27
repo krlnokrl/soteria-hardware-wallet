@@ -41,32 +41,40 @@ String getWordsInString(String data, char separator, int index)
 
 
 int RNGpin(uint8_t *dest, unsigned size) {
-  // Use the least-significant bits from the ADC for an unconnected pin (or connected to a source of
-  // random noise). This can take a long time to generate random data if the result of analogRead(0)
-  // doesn't change very frequently.
   while (size) {
-    uint8_t val = 0;
-    for (unsigned i = 0; i < 8; ++i) {
+    uint32_t rawPool = 0;
+
+    // Accumulate a 32-bit pool of mixed entropy per output byte
+    for (unsigned i = 0; i < 32; ++i) {
+      // CPU core timing jitter
+      uint32_t t1 = SysTick->VAL;
+
       int init = analogRead(0);
       int red = analogRead(1) & 0x01;
-      unsigned int count = 0;
+      uint16_t count = 0;
+
+      // Analog change with a safety guard
       while (analogRead(0) == init) {
         ++count;
+        if (count > 4096) break; 
       }
 
-      if (count == 0) {
-        init += red;
-        val = (val << 1) | (init & 0x01);
-      } else {
-        count += red;
-        val = (val << 1) | (count & 0x01);
-      }
+      // Post-read CPU core timing jitter
+      uint32_t t2 = SysTick->VAL;
+      uint32_t timingJitter = t1 ^ t2;
+
+      // Blend noise sources (init, red, count, jitter)
+      uint32_t bitSource = (init ^ red ^ count ^ timingJitter) & 0x01;
+      rawPool = (rawPool << 1) | bitSource;
     }
-    *dest = val;
-    ++dest;
+
+    // Whitening / Conditioning
+    uint32_t mixed = rawPool ^ (rawPool >> 7) ^ (rawPool >> 14) ^ (rawPool >> 21);
+    mixed ^= (mixed >> 4);
+
+    *dest++ = (uint8_t)(mixed & 0xFF);
     --size;
   }
-  // NOTE: it would be a good idea to hash the resulting random data using SHA-256 or similar.
   return 1;
 }
 
