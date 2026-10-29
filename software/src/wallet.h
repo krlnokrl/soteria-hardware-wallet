@@ -6,12 +6,11 @@
 #include <Bitcoin.h>
 #include <SecureStorage.h>
 
-//#include <SecureIC.h>
-//#include <ethers.h>
-
 #include "display/display_fx.h"
 #include "buttons.h"
 #include "crypto/btchd.h"
+#include "se/atecc.h"
+#include "se/se_wallet.h"
 
 #define GEN_FLAG 0xFEED
 
@@ -19,14 +18,14 @@
 #define YES 38
 #define NO 2
 
-// EEPROM key slot holding the FIDO2 master secret (stored unencrypted:
-// a security key must work without the wallet PIN).
-#define FIDO_KEY_SLOT 4
-
 // Confirmations requested over USB (FIDO2 user presence, host protocol
 // prompts) give up after this long without a button press, so an
 // unattended request cannot block the device indefinitely.
 #define USER_CONFIRM_TIMEOUT_MS 60000UL
+
+// The secure element (ATECC508A) holding the wallet secrets.
+extern Atecc gAtecc;
+extern SeWallet gSe;
 
 // Timeout for askYesNo() / askPin(): each prompt (each PIN digit) gives
 // up after ms without an answer. 0 = wait forever (on-device menus).
@@ -35,9 +34,16 @@ void setPromptTimeout(uint32_t ms);
 // True if the last askYesNo() / askPin() gave up because of the timeout.
 bool promptTimedOut();
 
+// A0 noise; only ever used mixed with the chip RNG (walletRandom).
 int RNGpin(uint8_t *dest, unsigned size);
 
+// Random bytes from the secure element RNG mixed with A0 noise.
+void walletRandom(uint8_t *out, size_t len);
+
 void generateWallet(Adafruit_SSD1306 &display,SecureStorage &eeprom);
+
+// A wallet of this firmware's format is stored (flag and public record).
+bool walletPresent(SecureStorage &eeprom);
 
 String getWordsInString(String data, char separator, int index);
 
@@ -49,22 +55,25 @@ enum WalletStatus {
   WALLET_WRONG_PIN,
   WALLET_INVALID,     // malformed or unsupported input
   WALLET_TOO_LARGE,   // result does not fit the output buffer
+  WALLET_SE_ERROR,    // secure element failure / wallet data mismatch
 };
 
-// Sign every (P2PKH) input of a raw legacy transaction; out = signed tx.
-WalletStatus signBtcTx(Adafruit_SSD1306 &display, const uint8_t *raw, size_t len, Key k,
+// Sign every (P2PKH) input of a raw legacy transaction with the key of
+// m/44'/0'/0'/0/0 (testnet: m/44'/1'/...); out = signed tx.
+WalletStatus signBtcTx(Adafruit_SSD1306 &display, SecureStorage &eeprom, const uint8_t *raw, size_t len,
                        bool testnet, uint8_t *out, size_t cap, size_t *outLen);
 
-// Blind-sign a 32-byte hash; sig = r | s | recovery id.
-WalletStatus signEthHash(Adafruit_SSD1306 &display, const uint8_t hash[32], Key k, uint8_t sig[65]);
+// Ethereum signers use m/44'/60'/0'/0/0. Blind-sign a 32-byte hash;
+// sig = r | s | recovery id.
+WalletStatus signEthHash(Adafruit_SSD1306 &display, SecureStorage &eeprom, const uint8_t hash[32], uint8_t sig[65]);
 
 // Parse, show and sign an unsigned EIP-155 / EIP-1559 transaction;
 // out = signed serialized transaction.
-WalletStatus signEthTx(Adafruit_SSD1306 &display, const uint8_t *raw, size_t len, Key k,
+WalletStatus signEthTx(Adafruit_SSD1306 &display, SecureStorage &eeprom, const uint8_t *raw, size_t len,
                        uint8_t sig[65], uint8_t *out, size_t cap, size_t *outLen);
 
 // EIP-191 personal_sign of msg.
-WalletStatus signEthMessage(Adafruit_SSD1306 &display, const uint8_t *msg, size_t len, Key k,
+WalletStatus signEthMessage(Adafruit_SSD1306 &display, SecureStorage &eeprom, const uint8_t *msg, size_t len,
                             uint8_t sig[65]);
 
 // Review a parsed, checked PSBT (psbtReview() == PSBT_OK) on the device,
@@ -72,40 +81,34 @@ WalletStatus signEthMessage(Adafruit_SSD1306 &display, const uint8_t *msg, size_
 WalletStatus signPsbt(Adafruit_SSD1306 &display, PSBT &psbt, const HdRecord &rec, bool testnet,
                       const PsbtSummary &sum, uint8_t *signedInputs);
 
-// Two-step confirmation on the device; true if the wallet was erased.
+// Two-step confirmation, then the PIN (erase the wallet, PIN and PUK
+// stay) or the PUK (factory reset). True if the wallet was erased.
 bool eraseDevice(Adafruit_SSD1306 &display, SecureStorage &eeprom);
 
-void xorKey(Key &k, uint8_t *pin);
+// Old PIN, PUK, new PIN twice.
+WalletStatus changePin(Adafruit_SSD1306 &display);
 
-// Decrypt k with pin and check it against the stored public key.
-// Returns false (k is then garbage) when the PIN is wrong.
-bool unlockKey(Key &k, uint8_t *pin);
+// FIDO2 master secret from the secure element; false if there is none.
+bool loadFidoSecret(uint8_t secret[32]);
 
-// Read the FIDO2 master secret; false if this wallet has none.
-bool loadFidoSecret(SecureStorage &eeprom, uint8_t secret[32]);
-
-// Build a human readable address string from a stored Key.
-// For BTC/BTCT this is the base58 legacy address; for ETH it is the
-// keccak256-derived, EIP-55 checksummed address.
-String keyAddress(const Key &k, bool testnet);
+// FIDO2 signature counter (secure element, monotonic).
+bool fidoCounter(uint32_t &value, bool increment);
 
 // Receive addresses (#0) of the stored wallet. Deriving them takes
 // seconds on this MCU, so they are computed on first use and cached
 // until the wallet changes (generate / erase).
 struct WalletAddresses {
-  bool segwit;              // false: wallet predates SegWit (no HD record)
-  char btc[96];             // native SegWit, if segwit
+  char btc[96];             // native SegWit
   char btcTest[96];
-  char btcLegacy[40];       // P2PKH from the legacy key slots
+  char btcLegacy[40];       // P2PKH of m/44'/0'/0'/0/0
   char btcTestLegacy[40];
   char eth[43];             // EIP-55
 };
 const WalletAddresses &walletAddresses(SecureStorage &eeprom);
 void forgetWalletAddresses();
 
-// Derive a checksummed Ethereum address (EIP-55) from a stored Key's
-// public key.
-size_t ethAddressFromKey(const Key &k, char out[43]);
+// Checksummed Ethereum address (EIP-55) of a compressed public key.
+size_t ethAddressFromPub33(const uint8_t pub[33], char out[43]);
 
 boolean askYesNo(Adafruit_SSD1306 &display);
 
@@ -115,7 +118,9 @@ Button waitButton();
 // Full-screen text for ms milliseconds.
 void showMessage(Adafruit_SSD1306 &display, const char *text, uint32_t ms);
 
-// Returns false if the user aborted with NO (pin is then incomplete).
-bool askPin(Adafruit_SSD1306 &display, uint8_t *pin);
+// Enter n hex digits (PIN: SE_PIN_DIGITS, PUK: SE_PUK_DIGITS) with the two
+// buttons: NO steps the shown digit, YES accepts it; each digit starts at
+// a random value. False on timeout (digits are then incomplete).
+bool askPin(Adafruit_SSD1306 &display, uint8_t *digits, int n, const char *title);
 
-#endif
+#endif

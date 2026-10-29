@@ -132,7 +132,7 @@ static void pressYes() { hostPress(YES, 3, 40); }   // ~200 ms: longer than the 
 static void boot() {
     gU2F.~SoteriaU2F();              // power cycle: RAM state gone, EEPROM kept
     new (&gU2F) SoteriaU2F();
-    gU2F.begin(display, eeprom);
+    gU2F.begin(display);
     const uint8_t nonce[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
     send(0xFFFFFFFF, 0x86, Bytes(nonce, nonce + 8));   // CTAPHID_INIT on the broadcast channel
     Bytes r = receive();
@@ -142,12 +142,9 @@ static void boot() {
 
 void setUp(void) {
     hostReset();
-    Key k;                           // the FIDO2 master secret a generated wallet stores
-    k.network = U2F;
-    k.id = FIDO_KEY_SLOT;
-    k.privateKey.fill(0x42);
-    k.publicKey.fill(0);
-    eeprom.storeKey(FIDO_KEY_SLOT, k);
+    uint8_t secret[32];              // the FIDO2 master secret a generated wallet stores
+    memset(secret, 0x42, sizeof(secret));
+    hostSetFidoSecret(secret);
     boot();
 }
 void tearDown(void) {}

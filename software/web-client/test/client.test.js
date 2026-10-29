@@ -43,7 +43,8 @@ class FakePort {
       setTimeout(() => ok(result), 100);
     };
     switch (req.cmd) {
-      case 'info': return ok({ fw: '0.4.0', proto: 1, wallet: true, name: 'test', segwit: true, host_access: false,
+      case 'info': return ok({ fw: '0.5.0', proto: 1, wallet: true, name: 'test', host_access: false,
+                               secure_element: { ready: true, serial: '0123e59156e00f25ee' },
                                fido: { supported: true, ready: true, counter: 3 },
                                limits: { max_line: 3072, max_payload: 2048, free_ram: 9000 } });
       case 'addresses': return confirmed({ btc: 'bc1qtest', btc_testnet: 'tb1qtest', btc_legacy: '1Test',
@@ -84,7 +85,8 @@ test('connect: DTR asserted, device info shown', async () => {
   await tick(150);
   assert.strictEqual($('status-text').textContent, 'Connected');
   assert.strictEqual(port.signals.dataTerminalReady, true);
-  assert.match($('device-info').textContent, /0\.4\.0/);
+  assert.match($('device-info').textContent, /0\.5\.0/);
+  assert.match($('device-info').textContent, /ATECC508A 0123e59156e00f25ee/);
 });
 
 test('request waiting for the device shows the confirm banner, then the result', async () => {

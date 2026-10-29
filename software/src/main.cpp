@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <Reset.h>
 #include <wallet.h>
 #include "utils.h"
 #include <qrcode.h>
@@ -10,6 +11,17 @@
 #define ROTATE_EVERY_MS 20000UL
 #define SAVER_IDLE_MS   180000UL   // then hide the addresses (privacy, OLED burn-in)
 #define REFRESH_MS      2000UL     // redraw at least this often (after USB prompts)
+
+// Only a double tap of the reset button (handled by the bootloader) may
+// start the bootloader. The Arduino core also resets into it when a host
+// opens and closes the serial port at 1200 baud (and on the SAMD21 erases
+// the start of the application to stay there), which any program on the
+// host could do. This hook runs every millisecond right before the core's
+// 250 ms reset countdown and cancels it.
+extern "C" int sysTickHook(void) {
+  cancelReset();
+  return 0;   // 0: the core's tick handler (millis) still runs
+}
 
 Adafruit_SSD1306 display(128, 64, &Wire, 4);
 
@@ -24,7 +36,8 @@ void setup() {
   pinMode(YES, INPUT);
   pinMode(NO, INPUT);
 
-  gU2F.begin(display, eeprom);   // initialise the USB HID / CTAPHID U2F interface
+  gSe.begin(gAtecc, eeprom);     // secure element: provisioned and paired?
+  gU2F.begin(display);           // initialise the USB HID / CTAPHID U2F interface
   gProtocol.begin(display, eeprom);   // JSON host protocol on USB serial
 }
 
@@ -38,17 +51,10 @@ struct WalletView {
 static void loadWallet(WalletView &w) {
   eeprom.getName(6, w.name);
   const WalletAddresses &a = walletAddresses(eeprom);
-  if (a.segwit) {
-    w.label[0] = "BTC";
-    w.label[1] = "BTC testnet";
-    strcpy(w.addr[0], a.btc);
-    strcpy(w.addr[1], a.btcTest);
-  } else {   // wallet created before SegWit support
-    w.label[0] = "BTC legacy";
-    w.label[1] = "BTC test legacy";
-    strcpy(w.addr[0], a.btcLegacy);
-    strcpy(w.addr[1], a.btcTestLegacy);
-  }
+  w.label[0] = "BTC";
+  w.label[1] = "BTC testnet";
+  strcpy(w.addr[0], a.btc);
+  strcpy(w.addr[1], a.btcTest);
   w.label[2] = "ETH / EVM";
   strcpy(w.addr[2], a.eth);
 }
@@ -115,8 +121,30 @@ static void renderCreate() {
   display.display();
 }
 
+// Without its secure element the device holds no wallet; USB keeps
+// running so the host can read `info`.
+static void renderNoSecureElement() {
+  beginFrame();
+  display.println("Secure element not");
+  display.println("ready.");
+  display.println();
+  display.println("Provision it with");
+  display.println("env:seprov_* (see");
+  display.println("docs/ATECC_PLAN.md).");
+  display.display();
+}
+
 void loop() {
-  if (eeprom.readFlag(6) != GEN_FLAG) {
+  if (!gSe.ready()) {
+    renderNoSecureElement();
+    for (;;) {
+      gU2F.poll();
+      gProtocol.poll();
+      delay(5);
+    }
+  }
+
+  if (!walletPresent(eeprom)) {
     renderCreate();
     buttonsArm();
     for (;;) {

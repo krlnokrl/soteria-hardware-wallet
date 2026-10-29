@@ -74,13 +74,14 @@ Both directions carry **one JSON object per line**, terminated by `\n` ("JSON Li
 |---|---|---|---|
 | `help` | – | `commands` {name: description} | – |
 | `ping` | – | `pong`, `uptime_ms` | – |
-| `info` | – | `fw`, `proto`, `wallet`, `name`, `segwit`, `host_access`, `fido` {`supported`, `ready`, `counter`}, `limits` {`max_line`, `max_payload`, `free_ram`} | – |
-| `addresses` | – | `btc`, `btc_testnet` (SegWit receive #0, if `segwit`), `btc_legacy`, `btc_testnet_legacy`, `eth` (EIP-55) | allow once per power-on |
+| `info` | – | `fw`, `proto`, `wallet`, `name`, `host_access`, `fido` {`supported`, `ready`, `counter`}, `secure_element` {`ready`, `serial`}, `limits` {`max_line`, `max_payload`, `free_ram`} | – |
+| `addresses` | – | `btc`, `btc_testnet` (SegWit receive #0), `btc_legacy`, `btc_testnet_legacy`, `eth` (EIP-55) | allow once per power-on |
 | `xpubs` | – | `fingerprint`, `btc` / `btc_testnet` {`path`, `xpub`, `receive`, `change`} (output descriptors with checksum) | allow once per power-on |
 | `show_address` | `coin` (`btc`, `btc_testnet`, `eth`), `index`, `change` (0/1) | `address`, `confirmed` (user says it matches) | compare on screen |
 | `pubkeys` | – | `btc`, `btc_testnet` (33-byte compressed), `eth` (65-byte uncompressed) | allow once per power-on |
 | `set_name` | `name` (1–8 printable ASCII, no spaces) | `name` | confirm |
-| `erase` | – | `erased` | confirm twice |
+| `erase` | – | `erased` | confirm twice, then PIN (wallet erase) or PUK (factory reset) |
+| `change_pin` | – | `changed` | confirm, current PIN, PUK, new PIN twice |
 | `sign_psbt` | `psbt` (base64, unsigned), `testnet` (bool) | `psbt` (base64, input PSBT plus signatures), `signed_inputs`, `send`, `fee`, `change` (satoshis) | review each payment, fee/change summary, PIN |
 | `sign_btc` | `tx` (unsigned legacy tx), `testnet` (bool) | `tx` (signed) | review each output, confirm, PIN |
 | `sign_eth_tx` | `tx` (unsigned EIP-1559 `0x02…` or legacy EIP-155, any chain id) | `tx` (signed, ready to broadcast), `r`, `s`, `recid`, `chain`, `chain_name`, `erc20` {`type`, `token`, `to`/`spender`, `from`, `amount`} if recognised | review chain, recipient/value or token call, max fee, confirm, PIN |
@@ -89,10 +90,9 @@ Both directions carry **one JSON object per line**, terminated by `\n` ("JSON Li
 
 ### Error codes
 
-`BAD_JSON`, `BAD_REQUEST`, `UNKNOWN_CMD`, `TOO_LARGE`, `NO_WALLET`, `NO_SEGWIT` (wallet created
-before SegWit support: erase and regenerate), `USER_REJECTED`,
+`BAD_JSON`, `BAD_REQUEST`, `UNKNOWN_CMD`, `TOO_LARGE`, `NO_WALLET`, `USER_REJECTED`,
 `USER_TIMEOUT` (no button press within 60 s), `WRONG_PIN`, `INVALID_INPUT` (malformed/unsupported transaction),
-`INTERNAL`.
+`SECURE_ELEMENT` (secure element error or wallet data mismatch), `INTERNAL`.
 
 ### Text commands
 

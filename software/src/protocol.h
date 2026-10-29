@@ -6,7 +6,7 @@
 #include <Adafruit_SSD1306.h>
 #include <SecureStorage.h>
 
-#define SOTERIA_FW_VERSION    "0.4.0"
+#define SOTERIA_FW_VERSION    "0.5.0"
 #define SOTERIA_PROTO_VERSION 1
 
 /* ------------------------------------------------------------------ */
@@ -83,6 +83,7 @@ private:
     void cmdPubkeys(JsonDocument &req, JsonDocument &resp);
     void cmdSetName(JsonDocument &req, JsonDocument &resp);
     void cmdErase(JsonDocument &req, JsonDocument &resp);
+    void cmdChangePin(JsonDocument &req, JsonDocument &resp);
     void cmdSignBtc(JsonDocument &req, JsonDocument &resp);
     void cmdSignEthHash(JsonDocument &req, JsonDocument &resp);
     void cmdSignEthTx(JsonDocument &req, JsonDocument &resp);

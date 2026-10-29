@@ -5,9 +5,10 @@
 #include "crypto/btchd.h"
 #include "buttons.h"
 
-// Placeholder: this board revision has no PIN potentiometer wired to an
-// analog input, so every PIN digit reads as 7 (PIN = 77777).
-#define PIN_PLACEHOLDER_DIGIT 7
+#define HARDENED 0x80000000UL
+
+Atecc gAtecc;
+SeWallet gSe;
 
 String getWordsInString(String data, char separator, int index)
 {
@@ -56,7 +57,7 @@ int RNGpin(uint8_t *dest, unsigned size) {
       // Analog change with a safety guard
       while (analogRead(0) == init) {
         ++count;
-        if (count > 4096) break; 
+        if (count > 1024) break;
       }
 
       // Post-read CPU core timing jitter
@@ -77,26 +78,42 @@ int RNGpin(uint8_t *dest, unsigned size) {
   return 1;
 }
 
+void walletRandom(uint8_t *out, size_t len){
+  gSe.random(out, len);
+}
+
+// uBitcoin's randomness hook (ECDSA blinding); its SAMD fallback is a
+// weak PRNG.
+extern "C" uint32_t random32(void){
+  uint32_t v;
+  gSe.random((uint8_t *)&v, sizeof(v));
+  return v;
+}
+
+/* ------------------------------------------------------------------ */
+/* Addresses                                                           */
+/* ------------------------------------------------------------------ */
+
 static WalletAddresses s_addresses;
 static bool s_addressesValid = false;
+
+static void legacyAddress(const uint8_t pub[33], bool testnet, char *out, size_t cap){
+  PublicKey pk(pub);   // parse compressed SEC bytes
+  pk.legacyAddress(out, cap, testnet ? &Testnet : &Mainnet);
+  out[cap - 1] = 0;
+}
 
 const WalletAddresses &walletAddresses(SecureStorage &eeprom){
   if (s_addressesValid) return s_addresses;
   WalletAddresses &a = s_addresses;
   memset(&a, 0, sizeof(a));
-  Key btc, eth, btct;
-  eeprom.getKey(0, btc);
-  eeprom.getKey(1, eth);
-  eeprom.getKey(2, btct);
-  keyAddress(btc, false).toCharArray(a.btcLegacy, sizeof(a.btcLegacy));
-  keyAddress(btct, true).toCharArray(a.btcTestLegacy, sizeof(a.btcTestLegacy));
-  ethAddressFromKey(eth, a.eth);
   HdRecord hd;
-  a.segwit = eeprom.readHd(hd);
-  if (a.segwit) {
-    hdAddress(hd, false, 0, 0, a.btc, sizeof(a.btc));
-    hdAddress(hd, true, 0, 0, a.btcTest, sizeof(a.btcTest));
-  }
+  if (!eeprom.readHd(hd)) return a;
+  legacyAddress(hd.btcLegacy, false, a.btcLegacy, sizeof(a.btcLegacy));
+  legacyAddress(hd.btcTestLegacy, true, a.btcTestLegacy, sizeof(a.btcTestLegacy));
+  ethAddressFromPub33(hd.eth, a.eth);
+  hdAddress(hd, false, 0, 0, a.btc, sizeof(a.btc));
+  hdAddress(hd, true, 0, 0, a.btcTest, sizeof(a.btcTest));
   s_addressesValid = true;
   return a;
 }
@@ -105,192 +122,24 @@ void forgetWalletAddresses(){
   s_addressesValid = false;
 }
 
-size_t ethAddressFromKey(const Key &k, char out[43]){
-  // The private key is PIN-encrypted, so expand the stored compressed
-  // public key to 0x04 || x || y and derive the Ethereum address from it.
-  PublicKey pub(k.publicKey.data());
-  pub.compressed = false;                 // uncompressed for Ethereum
+size_t ethAddressFromPub33(const uint8_t pub33[33], char out[43]){
+  // Expand to 0x04 || x || y and derive the Ethereum address from it.
+  PublicKey pub(pub33);
+  pub.compressed = false;
   uint8_t unpk[65];
   pub.sec(unpk, 65);
   return ethAddressFromPubkey(unpk, out);
 }
 
-String keyAddress(const Key &k, bool testnet){
-  if (k.network == ETH){
-    char addr[43];
-    ethAddressFromKey(k, addr);
-    return String(addr);
-  }
-  PublicKey pk(k.publicKey.data());   // parse compressed SEC bytes
-  char buf[64];
-  pk.legacyAddress(buf, sizeof(buf), testnet ? &Testnet : &Mainnet);
-  buf[sizeof(buf)-1] = 0;
-  return String(buf);
+// m/44'/coin'/0'/0/0
+static HDPrivateKey bip44Key(const HDPrivateKey &root, uint32_t coin){
+  uint32_t path[5] = { HARDENED | 44, HARDENED | coin, HARDENED, 0, 0 };
+  return root.derive(path, 5);
 }
 
-void generateWallet(Adafruit_SSD1306 &display,SecureStorage &eeprom)
-{
-  uint8_t pin[5];
-  uint8_t pin1[5];
-  uint8_t seed[32];
-
-  if (!askPin(display, pin)) return;
-  showMessage(display, "Enter the same PIN\nagain to confirm.", 1500);
-  if (!askPin(display, pin1)) return;
-  if (memcmp(pin, pin1, sizeof(pin)) != 0) {
-    showMessage(display, "PINs do not match!", 2000);
-    return;
-  }
-  display.clearDisplay();
-  displaySandglass(display);
-  displayProgressBar(display);
-  display.display();
-
-  RNGpin(seed, 32);
-  sha256(seed, 32, seed);
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  updateProgressBar(display,5);
-  display.display();
-
-  HDPrivateKey hdKey;
-  String s = seedToWords(seed, 16);
-  // seedToWords() leaves a trailing space; BIP39 hashes the mnemonic
-  // verbatim, so it must go or the 12 words restore a different wallet.
-  s.trim();
-  char mnem[200];
-  s.toCharArray(mnem, sizeof(mnem));
-  updateProgressBar(display,30);
-  display.display();
-  const char *pass = "";
-  hdKey.fromMnemonic(mnem, strlen(mnem), pass, 0);
-  updateProgressBar(display,40);
-  display.display();
-
-  // BIP32 root for SegWit (BIP84) accounts and PSBT signing
-  HdRecord hd;
-  hdMakeRecord(hdKey, pin, hd);
-  eeprom.writeHd(hd);
-  updateProgressBar(display,50);
-  display.display();
-
-  HDPrivateKey btcKey  = hdKey.hardenedChild(44).hardenedChild(0).hardenedChild(0).child(0).child(0);
-  HDPrivateKey btctKey = hdKey.hardenedChild(44).hardenedChild(1).hardenedChild(0).child(0).child(0);
-  HDPrivateKey ethKey  = hdKey.hardenedChild(44).hardenedChild(60).hardenedChild(0).child(0).child(0);
-  HDPrivateKey u2fKey  = hdKey.hardenedChild(44).hardenedChild(99).hardenedChild(0).child(0).child(0);
-  updateProgressBar(display,60);
-  display.display();
-
-  Key k;
-
-  // BTC  m/44'/0'/0'/0/0
-  k.network = BTC;
-  k.id = 0;
-  k.nonce = 0;
-  btcKey.getSecret(k.privateKey.data());
-  btcKey.publicKey().sec(k.publicKey.data(), k.publicKey.size());
-  xorKey(k, pin);
-  eeprom.storeKey(0, k);
-  updateProgressBar(display,70);
-  display.display();
-
-  // BTC testnet  m/44'/1'/0'/0/0
-  k.network = BTC;
-  k.id = 2;
-  k.nonce = 0;
-  btctKey.getSecret(k.privateKey.data());
-  btctKey.publicKey().sec(k.publicKey.data(), k.publicKey.size());
-  xorKey(k, pin);
-  eeprom.storeKey(2, k);
-  updateProgressBar(display,80);
-  display.display();
-
-  // U2F  m/44'/99'/0'/0/0
-  k.network = U2F;
-  k.id = 3;
-  k.nonce = 0;
-  u2fKey.getSecret(k.privateKey.data());
-  u2fKey.publicKey().sec(k.publicKey.data(), k.publicKey.size());
-
-  // FIDO2 master secret = HMAC(u2f key). Kept in clear so the security key
-  // works without the PIN; one-way, so leaking it exposes no wallet key.
-  Key fido;
-  fido.network = U2F;
-  fido.id = FIDO_KEY_SLOT;
-  fido.publicKey.fill(0);
-  const char fidoLabel[] = "Soteria FIDO2";
-  sha256Hmac((const uint8_t *)fidoLabel, strlen(fidoLabel),
-             k.privateKey.data(), k.privateKey.size(), fido.privateKey.data());
-  eeprom.storeKey(FIDO_KEY_SLOT, fido);
-
-  xorKey(k, pin);
-  eeprom.storeKey(3, k);
-  updateProgressBar(display,90);
-  display.display();
-
-  // ETH  m/44'/60'/0'/0/0
-  k.network = ETH;
-  k.id = 1;
-  k.nonce = 0;
-  ethKey.getSecret(k.privateKey.data());
-  ethKey.publicKey().sec(k.publicKey.data(), k.publicKey.size());
-  xorKey(k, pin);
-  eeprom.storeKey(1, k);
-  updateProgressBar(display,100);
-  display.display();
-
-  // Show the 12 words twice: once to write them down, once to check the
-  // copy. YES = next word, NO = previous word.
-  for (int step = 0; step < 24; ) {
-    int i = step % 12;
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(WHITE);
-    display.setCursor(0, 0);
-    display.print(step < 12 ? "Write down word " : "Check word ");
-    display.print(i + 1);
-    display.print("/12");
-    String word = getWordsInString(s, ' ', i);
-    word.trim();
-    display.setTextSize(2);   // 12 px per char, <= 8 letters
-    display.setCursor((display.width() - 12 * (int)word.length()) / 2, 24);
-    display.print(word);
-    displayYesNo(display);
-    display.display();
-    if (waitButton() == BTN_YES) step++;
-    else if (step > 0) step--;
-  }
-
-  uint16_t flag = GEN_FLAG;
-  eeprom.writeFlag((unsigned char)6, flag);
-  forgetWalletAddresses();
-}
-
-void xorKey(Key &k, uint8_t *pin){
-  uint8_t hash[32];
-  sha256(pin, 5, hash);
-  for(int i=0; i<32;i++)
-  {
-    k.privateKey[i] = k.privateKey[i] ^ hash[i];
-  }
-}
-
-bool unlockKey(Key &k, uint8_t *pin){
-  xorKey(k, pin);
-  PrivateKey pk(k.privateKey.data(), true, &Mainnet);
-  uint8_t sec[33];
-  pk.publicKey().sec(sec, sizeof(sec));
-  return memcmp(sec, k.publicKey.data(), sizeof(sec)) == 0;
-}
-
-bool loadFidoSecret(SecureStorage &eeprom, uint8_t secret[32]){
-  Key k;
-  eeprom.getKey(FIDO_KEY_SLOT, k);
-  // Erased / never-written slots read back as 0xFF and fail this check.
-  if (k.network != U2F || k.id != FIDO_KEY_SLOT) return false;
-  memcpy(secret, k.privateKey.data(), 32);
-  return true;
-}
+/* ------------------------------------------------------------------ */
+/* Prompts                                                             */
+/* ------------------------------------------------------------------ */
 
 Button waitButton(){
   buttonsArm();
@@ -342,43 +191,64 @@ static bool promptExpired(Adafruit_SSD1306 &display, uint32_t start){
   return true;
 }
 
-bool askPin(Adafruit_SSD1306 &display, uint8_t *pin){
+static void drawDigits(Adafruit_SSD1306 &display, const char *title, const uint8_t *digits,
+                       int n, int current){
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print(title);
+  if (current < n) {
+    display.print(" ");
+    display.print(current + 1);
+    display.print("/");
+    display.print(n);
+  }
+  display.setTextSize(2);   // 12 px per char
+  display.setCursor((display.width() - 12 * n) / 2, 22);
+  for (int v = 0; v < n; v++) {
+    if (v == current) display.print(digits[v], HEX);
+    else display.print(v < current ? "*" : "-");
+  }
+  display.setTextSize(1);
+  display.setCursor(0, 44);
+  display.print(current < n ? "NO: next value" : "Use these digits?");
+  displayYesNo(display);
+  display.display();
+}
+
+bool askPin(Adafruit_SSD1306 &display, uint8_t *digits, int n, const char *title){
   s_promptTimedOut = false;
-  for (int i = 0; i < 5; i++) {
-    buttonsArm();
-    uint32_t start = millis();   // each digit gets the full timeout
-    int shown = -1;
-    for (;;) {
-      if (promptExpired(display, start)) return false;
-      int num = PIN_PLACEHOLDER_DIGIT;
-      if (num != shown) {        // redraw only when the digit changes
-        shown = num;
-        display.clearDisplay();
-        display.setTextColor(WHITE);
-        display.setTextSize(1);
-        display.setCursor(0, 0);
-        display.print("Enter PIN digit ");
-        display.print(i + 1);
-        display.print("/5");
-        display.setTextSize(3);  // 5 chars x 18 px, centred
-        display.setCursor(19, 22);
-        for (int v = 0; v < 5; v++) {
-          if (v == i) display.print(num, HEX);
-          else display.print("*");
+  for (;;) {
+    for (int i = 0; i < n; i++) {
+      uint8_t start;
+      walletRandom(&start, 1);
+      digits[i] = start & 0x0F;   // random start: presses reveal nothing
+      buttonsArm();
+      uint32_t t0 = millis();     // each digit gets the full timeout
+      drawDigits(display, title, digits, n, i);
+      for (;;) {
+        if (promptExpired(display, t0)) return false;
+        Button b = buttonsPoll();
+        if (b == BTN_YES) break;
+        if (b == BTN_NO) {
+          digits[i] = (digits[i] + 1) & 0x0F;
+          drawDigits(display, title, digits, n, i);
         }
-        displayYesNo(display);
-        display.display();
+        delay(5);
       }
+    }
+    drawDigits(display, title, digits, n, n);
+    buttonsArm();
+    uint32_t t0 = millis();
+    for (;;) {
+      if (promptExpired(display, t0)) return false;
       Button b = buttonsPoll();
-      if (b == BTN_NO) return false;
-      if (b == BTN_YES) {
-        pin[i] = (uint8_t)shown;
-        break;
-      }
-      delay(10);
+      if (b == BTN_YES) return true;
+      if (b == BTN_NO) break;     // enter all digits again
+      delay(5);
     }
   }
-  return true;
 }
 
 boolean askYesNo(Adafruit_SSD1306 &display){
@@ -398,20 +268,228 @@ boolean askYesNo(Adafruit_SSD1306 &display){
   }
 }
 
-// Ask for the PIN and decrypt k with it.
-static WalletStatus unlockWithPin(Adafruit_SSD1306 &display, Key &k){
-  uint8_t pin[5];
-  if (!askPin(display, pin)) return WALLET_REJECTED;
-  if (!unlockKey(k, pin)) {
+static void showSeError(Adafruit_SSD1306 &display, SeResult r){
+  char msg[64];
+  snprintf(msg, sizeof(msg), "Failed:\n%s", seResultText(r));
+  showMessage(display, msg, 2500);
+}
+
+/* ------------------------------------------------------------------ */
+/* Wallet creation                                                     */
+/* ------------------------------------------------------------------ */
+
+// Show the PUK until YES; it is needed for PIN changes and factory reset.
+static void showPuk(Adafruit_SSD1306 &display, const uint8_t puk[SE_PUK_DIGITS]){
+  for (;;) {
+    display.clearDisplay();
+    display.setTextColor(WHITE);
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("Write down the PUK");
+    display.println("(with the 12 words):");
+    display.setTextSize(2);
+    display.setCursor(10, 26);
+    for (int i = 0; i < SE_PUK_DIGITS; i++) {
+      if (i == 4) display.print(' ');
+      display.print(puk[i], HEX);
+    }
+    displayYesNo(display);
+    display.display();
+    if (waitButton() == BTN_YES) return;
+  }
+}
+
+void generateWallet(Adafruit_SSD1306 &display,SecureStorage &eeprom)
+{
+  if (!gSe.ready()) {
+    showSeError(display, SE_NOT_READY);
+    return;
+  }
+  uint8_t pin[SE_PIN_DIGITS];
+  uint8_t pin1[SE_PIN_DIGITS];
+  uint8_t seed[32];
+
+  if (!askPin(display, pin, SE_PIN_DIGITS, "New PIN")) return;
+  if (!askPin(display, pin1, SE_PIN_DIGITS, "Repeat PIN")) return;
+  if (memcmp(pin, pin1, sizeof(pin)) != 0) {
+    showMessage(display, "PINs do not match!", 2000);
+    return;
+  }
+  display.clearDisplay();
+  displaySandglass(display);
+  displayProgressBar(display);
+  display.display();
+
+  // Entropy: secure element RNG mixed with A0 noise
+  if (!gSe.random(seed, sizeof(seed))) {
+    showMessage(display, "Secure element RNG\nfailed.", 2500);
+    return;
+  }
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  updateProgressBar(display,5);
+  display.display();
+
+  HDPrivateKey hdKey;
+  String s = seedToWords(seed, 16);
+  memset(seed, 0, sizeof(seed));
+  // seedToWords() leaves a trailing space; BIP39 hashes the mnemonic
+  // verbatim, so it must go or the 12 words restore a different wallet.
+  s.trim();
+  char mnem[200];
+  s.toCharArray(mnem, sizeof(mnem));
+  updateProgressBar(display,20);
+  display.display();
+  const char *pass = "";
+  hdKey.fromMnemonic(mnem, strlen(mnem), pass, 0);
+  memset(mnem, 0, sizeof(mnem));
+  updateProgressBar(display,40);
+  display.display();
+
+  // Public data for the EEPROM: BIP84 xpubs, BIP44 legacy and ETH keys
+  HdRecord hd;
+  hdMakeRecord(hdKey, hd);
+  bip44Key(hdKey, 0).publicKey().sec(hd.btcLegacy, sizeof(hd.btcLegacy));
+  bip44Key(hdKey, 1).publicKey().sec(hd.btcTestLegacy, sizeof(hd.btcTestLegacy));
+  bip44Key(hdKey, 60).publicKey().sec(hd.eth, sizeof(hd.eth));
+  updateProgressBar(display,60);
+  display.display();
+
+  // FIDO2 master secret = HMAC(m/44'/99'/0'/0/0). Readable without the
+  // PIN (a security key must work without it); one-way, so it exposes no
+  // wallet key. Derived from the seed, so the 12 words restore it.
+  uint8_t u2fPriv[32], fido[32], root[SE_ROOT_SIZE];
+  bip44Key(hdKey, 99).getSecret(u2fPriv);
+  const char fidoLabel[] = "Soteria FIDO2";
+  sha256Hmac((const uint8_t *)fidoLabel, strlen(fidoLabel), u2fPriv, sizeof(u2fPriv), fido);
+  memset(u2fPriv, 0, sizeof(u2fPriv));
+  hdRootBytes(hdKey, root);
+  updateProgressBar(display,70);
+  display.display();
+
+  // Seal everything in the secure element. A chip that still holds the
+  // PUK of an erased wallet needs it.
+  uint8_t puk[SE_PUK_DIGITS], oldPuk[SE_PUK_DIGITS];
+  SeResult r = gSe.create(pin, root, fido, nullptr, puk);
+  while (r == SE_NEED_PUK || r == SE_WRONG_PUK) {
+    showMessage(display, r == SE_NEED_PUK ? "The secure element\nholds a PUK: enter\nthe PUK of the old\nwallet."
+                                          : "Wrong PUK!", 2500);
+    if (!askPin(display, oldPuk, SE_PUK_DIGITS, "Old PUK")) break;
+    display.clearDisplay();
+    displaySandglass(display);
+    display.display();
+    r = gSe.create(pin, root, fido, oldPuk, puk);
+  }
+  memset(root, 0, sizeof(root));
+  memset(fido, 0, sizeof(fido));
+  memset(pin, 0, sizeof(pin));
+  memset(pin1, 0, sizeof(pin1));
+  memset(oldPuk, 0, sizeof(oldPuk));
+  if (r != SE_OK) {
+    showSeError(display, r);
+    return;
+  }
+  eeprom.eraseLegacyKeys();
+  eeprom.writeHd(hd);
+  updateProgressBar(display,100);
+  display.display();
+
+  // Show the 12 words twice: once to write them down, once to check the
+  // copy. YES = next word, NO = previous word.
+  for (int step = 0; step < 24; ) {
+    int i = step % 12;
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(WHITE);
+    display.setCursor(0, 0);
+    display.print(step < 12 ? "Write down word " : "Check word ");
+    display.print(i + 1);
+    display.print("/12");
+    String word = getWordsInString(s, ' ', i);
+    word.trim();
+    display.setTextSize(2);   // 12 px per char, <= 8 letters
+    display.setCursor((display.width() - 12 * (int)word.length()) / 2, 24);
+    display.print(word);
+    displayYesNo(display);
+    display.display();
+    if (waitButton() == BTN_YES) step++;
+    else if (step > 0) step--;
+  }
+  showPuk(display, puk);
+  memset(puk, 0, sizeof(puk));
+
+  uint16_t flag = GEN_FLAG;
+  eeprom.writeFlag((unsigned char)6, flag);
+  forgetWalletAddresses();
+}
+
+bool walletPresent(SecureStorage &eeprom){
+  HdRecord hd;
+  return eeprom.readFlag(6) == GEN_FLAG && eeprom.readHd(hd);
+}
+
+bool loadFidoSecret(uint8_t secret[32]){
+  return gSe.fidoSecret(secret);
+}
+
+bool fidoCounter(uint32_t &value, bool increment){
+  return gSe.fidoCounter(value, increment);
+}
+
+/* ------------------------------------------------------------------ */
+/* Unlocking                                                           */
+/* ------------------------------------------------------------------ */
+
+// Ask for the PIN; the secure element checks it and releases the root.
+static WalletStatus unlockRoot(Adafruit_SSD1306 &display, const HdRecord &rec, HDPrivateKey &root){
+  uint8_t pin[SE_PIN_DIGITS];
+  if (!askPin(display, pin, SE_PIN_DIGITS, "PIN")) return WALLET_REJECTED;
+  showMessage(display, "Checking PIN...", 0);
+  uint8_t raw[SE_ROOT_SIZE];
+  uint32_t failed = 0;
+  SeResult r = gSe.unlock(pin, raw, &failed);
+  memset(pin, 0, sizeof(pin));
+  if (r == SE_WRONG_PIN) {
     showWrongPin(display);
     return WALLET_WRONG_PIN;
+  }
+  if (r != SE_OK) {
+    showSeError(display, r);
+    return WALLET_SE_ERROR;
+  }
+  bool ours = hdRootFromBytes(raw, rec, root);
+  memset(raw, 0, sizeof(raw));
+  if (!ours) {
+    showMessage(display, "Wallet data does not\nmatch the secure\nelement.", 2500);
+    return WALLET_SE_ERROR;
+  }
+  if (failed) {
+    char msg[64];
+    snprintf(msg, sizeof(msg), "WARNING:\n%lu wrong PIN\nattempt(s) since the\nlast unlock!", (unsigned long)failed);
+    showMessage(display, msg, 3000);
   }
   return WALLET_OK;
 }
 
+// PIN, then the BIP44 key m/44'/coin'/0'/0/0.
+static WalletStatus unlockCoinKey(Adafruit_SSD1306 &display, SecureStorage &eeprom, uint32_t coin,
+                                  PrivateKey &key){
+  HdRecord rec;
+  if (!eeprom.readHd(rec)) return WALLET_SE_ERROR;
+  HDPrivateKey root;
+  WalletStatus st = unlockRoot(display, rec, root);
+  if (st != WALLET_OK) return st;
+  showMessage(display, "Signing...", 0);
+  HDPrivateKey child = bip44Key(root, coin);
+  uint8_t secret[32];
+  child.getSecret(secret);
+  key = PrivateKey(secret, true, coin == 1 ? &Testnet : &Mainnet);
+  memset(secret, 0, sizeof(secret));
+  return WALLET_OK;
+}
+
 // ECDSA secp256k1 (RFC 6979) over hash; sig = r(32) | s(32) | recovery id
-static void signHash(const Key &k, const uint8_t hash[32], uint8_t sig[65]){
-  PrivateKey pk(k.privateKey.data(), true, &Mainnet);
+static void signHash(const PrivateKey &pk, const uint8_t hash[32], uint8_t sig[65]){
   pk.sign(hash).bin(sig, 65);
 }
 
@@ -445,7 +523,7 @@ static void printEthAddr(Adafruit_SSD1306 &display, const char *label, const uin
   display.println(buf);
 }
 
-WalletStatus signBtcTx(Adafruit_SSD1306 &display, const uint8_t *raw, size_t len, Key k,
+WalletStatus signBtcTx(Adafruit_SSD1306 &display, SecureStorage &eeprom, const uint8_t *raw, size_t len,
                        bool testnet, uint8_t *out, size_t cap, size_t *outLen){
   Tx tx;
   // uBitcoin's parsers are not safe on malformed input: check structure first
@@ -475,9 +553,9 @@ WalletStatus signBtcTx(Adafruit_SSD1306 &display, const uint8_t *raw, size_t len
   display.display();
   if (!askYesNo(display)) return WALLET_REJECTED;
 
-  WalletStatus st = unlockWithPin(display, k);
+  PrivateKey pk;
+  WalletStatus st = unlockCoinKey(display, eeprom, testnet ? 1 : 0, pk);
   if (st != WALLET_OK) return st;
-  PrivateKey pk(k.privateKey.data(), true, testnet ? &Testnet : &Mainnet);
   for(int i=0; i<tx.inputsNumber; i++){
     // signInput() sets scriptSig to <sig> <pubkey> (P2PKH)
     tx.signInput(i, pk);
@@ -488,21 +566,22 @@ WalletStatus signBtcTx(Adafruit_SSD1306 &display, const uint8_t *raw, size_t len
   return WALLET_OK;
 }
 
-WalletStatus signEthHash(Adafruit_SSD1306 &display, const uint8_t hash[32], Key k, uint8_t sig[65]){
+WalletStatus signEthHash(Adafruit_SSD1306 &display, SecureStorage &eeprom, const uint8_t hash[32], uint8_t sig[65]){
   // Blind signing: nothing but the hash can be shown, so show all of it.
   beginScreen(display, "Sign ETH hash? BLIND");
   display.println(toHex(hash, 32));
   display.display();
   if (!askYesNo(display)) return WALLET_REJECTED;
 
-  WalletStatus st = unlockWithPin(display, k);
+  PrivateKey pk;
+  WalletStatus st = unlockCoinKey(display, eeprom, 60, pk);
   if (st != WALLET_OK) return st;
-  signHash(k, hash, sig);
+  signHash(pk, hash, sig);
   showSigned(display);
   return WALLET_OK;
 }
 
-WalletStatus signEthTx(Adafruit_SSD1306 &display, const uint8_t *raw, size_t len, Key k,
+WalletStatus signEthTx(Adafruit_SSD1306 &display, SecureStorage &eeprom, const uint8_t *raw, size_t len,
                        uint8_t sig[65], uint8_t *out, size_t cap, size_t *outLen){
   EthTx tx;
   if (!ethTxParse(raw, len, tx)) return WALLET_INVALID;
@@ -581,18 +660,19 @@ WalletStatus signEthTx(Adafruit_SSD1306 &display, const uint8_t *raw, size_t len
   display.display();
   if (!askYesNo(display)) return WALLET_REJECTED;
 
-  WalletStatus st = unlockWithPin(display, k);
+  PrivateKey pk;
+  WalletStatus st = unlockCoinKey(display, eeprom, 60, pk);
   if (st != WALLET_OK) return st;
   uint8_t hash[32];
   keccak256(raw, len, hash);   // both formats sign keccak256(unsigned bytes)
-  signHash(k, hash, sig);
+  signHash(pk, hash, sig);
   *outLen = ethTxEncodeSigned(tx, sig, out, cap);
   if (*outLen == 0) return WALLET_TOO_LARGE;
   showSigned(display);
   return WALLET_OK;
 }
 
-WalletStatus signEthMessage(Adafruit_SSD1306 &display, const uint8_t *msg, size_t len, Key k,
+WalletStatus signEthMessage(Adafruit_SSD1306 &display, SecureStorage &eeprom, const uint8_t *msg, size_t len,
                             uint8_t sig[65]){
   beginScreen(display, "Sign ETH message?");
   for (size_t i = 0; i < len && i < 100; i++) {
@@ -603,11 +683,12 @@ WalletStatus signEthMessage(Adafruit_SSD1306 &display, const uint8_t *msg, size_
   display.display();
   if (!askYesNo(display)) return WALLET_REJECTED;
 
-  WalletStatus st = unlockWithPin(display, k);
+  PrivateKey pk;
+  WalletStatus st = unlockCoinKey(display, eeprom, 60, pk);
   if (st != WALLET_OK) return st;
   uint8_t hash[32];
   ethPersonalMessageHash(msg, len, hash);
-  signHash(k, hash, sig);
+  signHash(pk, hash, sig);
   showSigned(display);
   return WALLET_OK;
 }
@@ -648,13 +729,9 @@ WalletStatus signPsbt(Adafruit_SSD1306 &display, PSBT &psbt, const HdRecord &rec
   display.display();
   if (!askYesNo(display)) return WALLET_REJECTED;
 
-  uint8_t pin[5];
-  if (!askPin(display, pin)) return WALLET_REJECTED;
   HDPrivateKey root;
-  if (!hdUnlock(rec, pin, root)) {
-    showWrongPin(display);
-    return WALLET_WRONG_PIN;
-  }
+  WalletStatus st = unlockRoot(display, rec, root);
+  if (st != WALLET_OK) return st;
   showMessage(display, "Signing...", 0);
   *signedInputs = psbtSign(psbt, root);
   if (*signedInputs == 0) return WALLET_INVALID;
@@ -671,28 +748,83 @@ bool eraseDevice(Adafruit_SSD1306 &display, SecureStorage &eeprom){
   display.println("\nAll keys will be lost forever!");
   display.display();
   delay(2000);
-  if(askYesNo(display)){
-    display.setTextSize(1);
-    display.println("Are you sure you want to erase?");
-    display.display();
-    if(askYesNo(display)){
-      uint16_t flag = 0xFFFF;
-      eeprom.writeFlag(6, flag);
-      Key k;
-      k.privateKey.fill(0xFF);
-      k.publicKey.fill(0xFF);
-      for (int i = 0; i < 6; i++)
-      {
-        eeprom.storeKey(i, k);
+  if (!askYesNo(display)) return false;
+  display.setTextSize(1);
+  display.println("Are you sure you want to erase?");
+  display.display();
+  if (!askYesNo(display)) return false;
+
+  // PIN: erase the wallet (PIN and PUK stay). PUK: factory reset (also
+  // for a forgotten PIN).
+  display.println("Authorise with:");
+  display.println();
+  display.println("YES: PIN");
+  display.println("NO:  PUK (forgot PIN,");
+  display.println("     factory reset)");
+  bool withPin = askYesNo(display);
+  if (promptTimedOut()) return false;
+  SeResult r;
+  if (withPin) {
+    uint8_t pin[SE_PIN_DIGITS];
+    if (!askPin(display, pin, SE_PIN_DIGITS, "PIN")) return false;
+    showMessage(display, "Erasing...", 0);
+    r = gSe.wipe(pin);
+    memset(pin, 0, sizeof(pin));
+  } else {
+    uint8_t puk[SE_PUK_DIGITS];
+    if (!askPin(display, puk, SE_PUK_DIGITS, "PUK")) return false;
+    showMessage(display, "Factory reset...", 0);
+    r = gSe.factoryReset(puk);
+    memset(puk, 0, sizeof(puk));
+  }
+  if (r != SE_OK) {
+    showSeError(display, r);
+    return false;
+  }
+
+  uint16_t flag = 0xFFFF;
+  eeprom.writeFlag(6, flag);
+  eeprom.writeName(6, "");
+  eeprom.eraseHd();
+  eeprom.eraseLegacyKeys();
+  forgetWalletAddresses();
+  showMessage(display, "DONE!", 1000);
+  return true;
+}
+
+WalletStatus changePin(Adafruit_SSD1306 &display){
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.println("Change the PIN?");
+  display.println();
+  display.println("Needs the current PIN");
+  display.println("and the PUK.");
+  if (!askYesNo(display)) return WALLET_REJECTED;
+  uint8_t oldPin[SE_PIN_DIGITS], puk[SE_PUK_DIGITS], pin[SE_PIN_DIGITS], pin1[SE_PIN_DIGITS];
+  WalletStatus st = WALLET_REJECTED;
+  if (askPin(display, oldPin, SE_PIN_DIGITS, "Current PIN") &&
+      askPin(display, puk, SE_PUK_DIGITS, "PUK") &&
+      askPin(display, pin, SE_PIN_DIGITS, "New PIN") &&
+      askPin(display, pin1, SE_PIN_DIGITS, "Repeat PIN")) {
+    if (memcmp(pin, pin1, sizeof(pin)) != 0) {
+      showMessage(display, "PINs do not match!", 2000);
+    } else {
+      showMessage(display, "Changing PIN...", 0);
+      SeResult r = gSe.changePin(oldPin, puk, pin);
+      if (r == SE_OK) {
+        showMessage(display, "PIN changed.", 1500);
+        st = WALLET_OK;
+      } else {
+        showSeError(display, r);
+        st = r == SE_WRONG_PIN ? WALLET_WRONG_PIN : r == SE_WRONG_PUK ? WALLET_REJECTED : WALLET_SE_ERROR;
       }
-      eeprom.writeName(6, "");
-      eeprom.eraseHd();
-      forgetWalletAddresses();
-      display.println("DONE!");
-      display.display();
-      delay(1000);
-      return true;
     }
   }
-  return false;
+  memset(oldPin, 0, sizeof(oldPin));
+  memset(puk, 0, sizeof(puk));
+  memset(pin, 0, sizeof(pin));
+  memset(pin1, 0, sizeof(pin1));
+  return st;
 }

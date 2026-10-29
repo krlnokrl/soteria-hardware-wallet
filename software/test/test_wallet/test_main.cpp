@@ -16,7 +16,6 @@
 
 static const char *MNEMONIC =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-static const uint8_t PIN[5] = { 7, 7, 7, 7, 7 };   // placeholder PIN of this board revision
 
 static HDPrivateKey root() { return HDPrivateKey(MNEMONIC, strlen(MNEMONIC), "", 0); }
 
@@ -56,10 +55,11 @@ static void test_bip39_words(void) {
     }
 }
 
-// BIP84 native SegWit accounts, descriptor, PIN-encrypted root
+// BIP84 native SegWit accounts, descriptor, root as sealed in the
+// secure element
 static void test_bip84_addresses_and_descriptor(void) {
     HdRecord rec;
-    hdMakeRecord(root(), PIN, rec);
+    hdMakeRecord(root(), rec);
     char buf[256];
     TEST_ASSERT_EQUAL_STRING("73c5da0a", hex(rec.fingerprint, 4).c_str());
     hdAddress(rec, false, 0, 0, buf, sizeof(buf));
@@ -72,10 +72,15 @@ static void test_bip84_addresses_and_descriptor(void) {
     TEST_ASSERT_EQUAL_STRING("wpkh([73c5da0a/84h/0h/0h]xpub6CatWdiZiodmUeTDp8LT5or8nmbKNcuyvz7WyksVFkKB4RHw"
                              "CD3XyuvPEbvqAQY3rAPshWcMLoP2fMFMKHPJ4ZeZXYVUhLv1VMrjPC7PW6V/0/*)#afwvtk2s", buf);
 
+    uint8_t bytes[64];
+    hdRootBytes(root(), bytes);
     HDPrivateKey unlocked;
-    TEST_ASSERT_TRUE(hdUnlock(rec, PIN, unlocked));
-    const uint8_t wrong[5] = { 1, 2, 3, 4, 5 };
-    TEST_ASSERT_FALSE(hdUnlock(rec, wrong, unlocked));
+    TEST_ASSERT_TRUE(hdRootFromBytes(bytes, rec, unlocked));
+    uint8_t again[64];
+    hdRootBytes(unlocked, again);
+    TEST_ASSERT_EQUAL_MEMORY(bytes, again, 64);
+    bytes[5] ^= 1;                   // another root: fingerprint differs
+    TEST_ASSERT_FALSE(hdRootFromBytes(bytes, rec, unlocked));
 }
 
 // BIP44 legacy BTC and Ethereum (keccak + EIP-55) addresses
@@ -151,7 +156,7 @@ static void test_psbt_review_and_sign(void) {
     TEST_ASSERT_EQUAL_UINT32(len, psbt.parse(raw, len));
 
     HdRecord rec;
-    hdMakeRecord(root(), PIN, rec);
+    hdMakeRecord(root(), rec);
     PsbtSummary sum;
     TEST_ASSERT_EQUAL_INT(PSBT_OK, psbtReview(psbt, rec, false, sum));
     TEST_ASSERT_EQUAL_UINT32(1000, (uint32_t)sum.fee);
@@ -162,9 +167,7 @@ static void test_psbt_review_and_sign(void) {
     btcScriptAddress(psbt.tx.txOuts[0].scriptPubkey, false, addr, sizeof(addr));
     TEST_ASSERT_EQUAL_STRING("bc1p8unxxxj9patgkecf3n0z6x5su3u54ndu7nm9tu45jyvn8m366mdqsef3ta", addr);   // bech32m
 
-    HDPrivateKey unlocked;
-    TEST_ASSERT_TRUE(hdUnlock(rec, PIN, unlocked));
-    TEST_ASSERT_EQUAL_UINT8(1, psbtSign(psbt, unlocked));
+    TEST_ASSERT_EQUAL_UINT8(1, psbtSign(psbt, root()));
     PSBTPartialSignature &ps = psbt.txInsMeta[0].signatures[0];
     uint8_t h[32];
     psbt.tx.sigHashSegwit(h, 0, ps.pubkey.script(), 100000);   // BIP143, P2WPKH script code

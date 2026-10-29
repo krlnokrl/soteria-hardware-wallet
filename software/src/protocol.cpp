@@ -20,7 +20,8 @@ const SoteriaProtocol::Command SoteriaProtocol::commands[] = {
     { "show_address",     &SoteriaProtocol::cmdShowAddress,    true,  "{coin, index, change}: verify an address on the device" },
     { "pubkeys",          &SoteriaProtocol::cmdPubkeys,        true,  "public keys (hex)" },
     { "set_name",         &SoteriaProtocol::cmdSetName,        true,  "{name}: rename wallet (<= 8 chars)" },
-    { "erase",            &SoteriaProtocol::cmdErase,          true,  "erase wallet (confirm twice on device)" },
+    { "erase",            &SoteriaProtocol::cmdErase,          true,  "erase wallet (confirm twice, then PIN or PUK on device)" },
+    { "change_pin",       &SoteriaProtocol::cmdChangePin,      true,  "change the PIN (current PIN, PUK, new PIN on device)" },
     { "sign_psbt",        &SoteriaProtocol::cmdSignPsbt,       true,  "{psbt (base64), testnet}: sign SegWit PSBT" },
     { "sign_btc",         &SoteriaProtocol::cmdSignBtc,        true,  "{tx, testnet}: sign legacy P2PKH tx" },
     { "sign_eth_hash",    &SoteriaProtocol::cmdSignEthHash,    true,  "{hash}: blind-sign 32-byte hash" },
@@ -378,7 +379,7 @@ bool SoteriaProtocol::requireHostAccess(JsonDocument &resp) {
 }
 
 bool SoteriaProtocol::walletPresent() {
-    return _eeprom->readFlag(6) == GEN_FLAG;
+    return ::walletPresent(*_eeprom);
 }
 
 void SoteriaProtocol::failStatus(JsonDocument &resp, int status) {
@@ -387,6 +388,7 @@ void SoteriaProtocol::failStatus(JsonDocument &resp, int status) {
         case WALLET_WRONG_PIN: fail(resp, "WRONG_PIN", "wrong PIN"); break;
         case WALLET_INVALID:   fail(resp, "INVALID_INPUT", "malformed or unsupported input"); break;
         case WALLET_TOO_LARGE: fail(resp, "TOO_LARGE", "result too large"); break;
+        case WALLET_SE_ERROR:  fail(resp, "SECURE_ELEMENT", "secure element error or wallet data mismatch"); break;
         default:               fail(resp, "INTERNAL", "unexpected error"); break;
     }
 }
@@ -427,12 +429,17 @@ void SoteriaProtocol::cmdInfo(JsonDocument &req, JsonDocument &resp) {
     fido["supported"] = false;
 #endif
     uint8_t secret[32];
-    fido["ready"] = loadFidoSecret(*_eeprom, secret);
+    fido["ready"] = loadFidoSecret(secret);
     memset(secret, 0, sizeof(secret));
-    fido["counter"] = _eeprom->readFidoCounter();
+    uint32_t counter = 0;
+    if (fidoCounter(counter, false)) fido["counter"] = counter;
 
-    HdRecord hd;
-    res["segwit"] = wallet && _eeprom->readHd(hd);   // false: wallet predates SegWit
+    JsonObject se = res["secure_element"].to<JsonObject>();
+    se["ready"] = gSe.ready();
+    if (gSe.ready()) {
+        char sn[19];
+        se["serial"] = hexEncode(gSe.serial(), 9, sn);
+    }
 
     JsonObject lim = res["limits"].to<JsonObject>();
     lim["max_line"] = PROTO_MAX_LINE;
@@ -444,10 +451,8 @@ void SoteriaProtocol::cmdAddresses(JsonDocument &req, JsonDocument &resp) {
     if (!requireHostAccess(resp)) { fail(resp, "USER_REJECTED", "access denied on the device"); return; }
     const WalletAddresses &a = walletAddresses(*_eeprom);   // cached: derivation takes seconds
     JsonObject res = succeed(resp);
-    if (a.segwit) {
-        res["btc"] = a.btc;
-        res["btc_testnet"] = a.btcTest;
-    }
+    res["btc"] = a.btc;
+    res["btc_testnet"] = a.btcTest;
     res["btc_legacy"] = a.btcLegacy;
     res["btc_testnet_legacy"] = a.btcTestLegacy;
     res["eth"] = a.eth;
@@ -455,15 +460,13 @@ void SoteriaProtocol::cmdAddresses(JsonDocument &req, JsonDocument &resp) {
 
 void SoteriaProtocol::cmdPubkeys(JsonDocument &req, JsonDocument &resp) {
     if (!requireHostAccess(resp)) { fail(resp, "USER_REJECTED", "access denied on the device"); return; }
-    Key btc, eth, btct;
-    _eeprom->getKey(0, btc);
-    _eeprom->getKey(1, eth);
-    _eeprom->getKey(2, btct);
+    HdRecord hd;
+    if (!_eeprom->readHd(hd)) { fail(resp, "NO_WALLET", "no wallet"); return; }
     char hex[131];
     JsonObject res = succeed(resp);
-    res["btc"] = hexEncode(btc.publicKey.data(), 33, hex);
-    res["btc_testnet"] = hexEncode(btct.publicKey.data(), 33, hex);
-    PublicKey pub(eth.publicKey.data());   // ETH tooling wants 0x04 | x | y
+    res["btc"] = hexEncode(hd.btcLegacy, 33, hex);
+    res["btc_testnet"] = hexEncode(hd.btcTestLegacy, 33, hex);
+    PublicKey pub(hd.eth);                 // ETH tooling wants 0x04 | x | y
     pub.compressed = false;
     uint8_t unc[65];
     pub.sec(unc, sizeof(unc));
@@ -497,17 +500,21 @@ void SoteriaProtocol::cmdErase(JsonDocument &req, JsonDocument &resp) {
     succeed(resp)["erased"] = true;
 }
 
+void SoteriaProtocol::cmdChangePin(JsonDocument &req, JsonDocument &resp) {
+    sendEvent(resp, "confirm_on_device");
+    WalletStatus st = changePin(*_display);
+    if (st != WALLET_OK) { failStatus(resp, st); return; }
+    succeed(resp)["changed"] = true;
+}
+
 void SoteriaProtocol::cmdSignBtc(JsonDocument &req, JsonDocument &resp) {
     int len = hexDecode(_payload, _payloadLen, s_raw, sizeof(s_raw));
     if (len <= 0) { fail(resp, "BAD_REQUEST", "tx: hex, max 2048 bytes"); return; }
     bool testnet = req["testnet"] | false;
     if (!btcTxWellFormed(s_raw, (size_t)len)) { fail(resp, "INVALID_INPUT", "malformed transaction"); return; }
-    Key k;
-    _eeprom->getKey(testnet ? 2 : 0, k);
-
     sendEvent(resp, "confirm_on_device");
     size_t outLen = 0;
-    WalletStatus st = signBtcTx(*_display, s_raw, (size_t)len, k, testnet, s_out, sizeof(s_out), &outLen);
+    WalletStatus st = signBtcTx(*_display, *_eeprom, s_raw, (size_t)len, testnet, s_out, sizeof(s_out), &outLen);
     if (st != WALLET_OK) { failStatus(resp, st); return; }
     succeed(resp);
     streamResult("tx", s_out, outLen, false);
@@ -517,12 +524,9 @@ void SoteriaProtocol::cmdSignEthHash(JsonDocument &req, JsonDocument &resp) {
     uint8_t hash[32];
     const char *hashHex = req["hash"].as<const char *>();
     if (hexDecode(hashHex, hashHex ? strlen(hashHex) : 0, hash, sizeof(hash)) != 32) { fail(resp, "BAD_REQUEST", "hash: 32 bytes hex"); return; }
-    Key k;
-    _eeprom->getKey(1, k);
-
     sendEvent(resp, "confirm_on_device");
     uint8_t sig[65];
-    WalletStatus st = signEthHash(*_display, hash, k, sig);
+    WalletStatus st = signEthHash(*_display, *_eeprom, hash, sig);
     if (st != WALLET_OK) { failStatus(resp, st); return; }
     putEthSignature(succeed(resp), sig);
 }
@@ -535,13 +539,10 @@ void SoteriaProtocol::cmdSignEthTx(JsonDocument &req, JsonDocument &resp) {
         fail(resp, "INVALID_INPUT", "not an unsigned EIP-1559 or EIP-155 transaction");
         return;
     }
-    Key k;
-    _eeprom->getKey(1, k);
-
     sendEvent(resp, "confirm_on_device");
     uint8_t sig[65];
     size_t outLen = 0;
-    WalletStatus st = signEthTx(*_display, s_raw, (size_t)len, k, sig, s_out, sizeof(s_out), &outLen);
+    WalletStatus st = signEthTx(*_display, *_eeprom, s_raw, (size_t)len, sig, s_out, sizeof(s_out), &outLen);
     if (st != WALLET_OK) { failStatus(resp, st); return; }
     JsonObject res = succeed(resp);
     char hex[65];
@@ -586,19 +587,16 @@ void SoteriaProtocol::cmdSignEthMessage(JsonDocument &req, JsonDocument &resp) {
         len = hexDecode(_payload, _payloadLen, s_raw, sizeof(s_raw));
     }
     if (len < 0) { fail(resp, "BAD_REQUEST", "message (text) or hex, max 2048 bytes"); return; }
-    Key k;
-    _eeprom->getKey(1, k);
-
     sendEvent(resp, "confirm_on_device");
     uint8_t sig[65];
-    WalletStatus st = signEthMessage(*_display, s_raw, (size_t)len, k, sig);
+    WalletStatus st = signEthMessage(*_display, *_eeprom, s_raw, (size_t)len, sig);
     if (st != WALLET_OK) { failStatus(resp, st); return; }
     putEthSignature(succeed(resp), sig);
 }
 
 void SoteriaProtocol::cmdXpubs(JsonDocument &req, JsonDocument &resp) {
     HdRecord hd;
-    if (!_eeprom->readHd(hd)) { fail(resp, "NO_SEGWIT", "wallet predates SegWit support: erase and regenerate"); return; }
+    if (!_eeprom->readHd(hd)) { fail(resp, "NO_WALLET", "no wallet"); return; }
     if (!requireHostAccess(resp)) { fail(resp, "USER_REJECTED", "access denied on the device"); return; }
     JsonObject res = succeed(resp);
     char fp[9], desc[200];
@@ -625,13 +623,13 @@ void SoteriaProtocol::cmdShowAddress(JsonDocument &req, JsonDocument &resp) {
 
     if (strcmp(coin, "eth") == 0) {
         if (index != 0 || change != 0) { fail(resp, "BAD_REQUEST", "eth: only index 0"); return; }
-        Key k;
-        _eeprom->getKey(1, k);
-        ethAddressFromKey(k, addr);
+        HdRecord hd;
+        if (!_eeprom->readHd(hd)) { fail(resp, "NO_WALLET", "no wallet"); return; }
+        ethAddressFromPub33(hd.eth, addr);
         snprintf(title, sizeof(title), "ETH/EVM address");
     } else if (testnet || strcmp(coin, "btc") == 0) {
         HdRecord hd;
-        if (!_eeprom->readHd(hd)) { fail(resp, "NO_SEGWIT", "wallet predates SegWit support: erase and regenerate"); return; }
+        if (!_eeprom->readHd(hd)) { fail(resp, "NO_WALLET", "no wallet"); return; }
         if (index >= 0x80000000UL || change > 1) { fail(resp, "BAD_REQUEST", "index < 2^31, change 0 or 1"); return; }
         hdAddress(hd, testnet, change, index, addr, sizeof(addr));
         snprintf(title, sizeof(title), "%s %s #%lu", testnet ? "tBTC" : "BTC",
@@ -660,7 +658,7 @@ void SoteriaProtocol::cmdShowAddress(JsonDocument &req, JsonDocument &resp) {
 
 void SoteriaProtocol::cmdSignPsbt(JsonDocument &req, JsonDocument &resp) {
     HdRecord hd;
-    if (!_eeprom->readHd(hd)) { fail(resp, "NO_SEGWIT", "wallet predates SegWit support: erase and regenerate"); return; }
+    if (!_eeprom->readHd(hd)) { fail(resp, "NO_WALLET", "no wallet"); return; }
     bool testnet = req["testnet"] | false;
     size_t len = _payload ? fromBase64(_payload, _payloadLen, s_raw, sizeof(s_raw)) : 0;
     if (len == 0) { fail(resp, "BAD_REQUEST", "psbt: base64, max 2048 bytes"); return; }

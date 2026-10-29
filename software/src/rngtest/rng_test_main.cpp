@@ -37,7 +37,7 @@ static RawSample rawSample() {
 
   while (analogRead(0) == init) {
     ++count;
-    if (count > 4096) break;
+    if (count > 1024) break;
   }
 
   uint32_t timingJitter = t1 ^ SysTick->VAL;

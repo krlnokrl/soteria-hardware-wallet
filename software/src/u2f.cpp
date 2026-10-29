@@ -199,7 +199,7 @@ SoteriaU2F::SoteriaU2F()
       _epIn(0), _epOut(0), _rxGot(0), _rxExpected(0), _rxSeq(0), _rxCmd(0),
       _rxCid(0), _rxLast(0), _rxActive(false), _nextCid(0x01000001UL),
 #endif
-      _display(nullptr), _eeprom(nullptr)
+      _display(nullptr)
 {
 #ifdef SOTERIA_HAS_PLUGGABLE_USB
     // _hid was constructed (plug() ran) before this body; copy the assigned
@@ -209,9 +209,8 @@ SoteriaU2F::SoteriaU2F()
 #endif
 }
 
-bool SoteriaU2F::begin(Adafruit_SSD1306 &display, SecureStorage &eeprom) {
+bool SoteriaU2F::begin(Adafruit_SSD1306 &display) {
     _display = &display;
-    _eeprom = &eeprom;
     // PluggableUSB().plug() was already invoked from the HIDModule
     // constructor (before main() -> USBDevice.init()). Here we only report
     // whether the HID interface is available on this core.
@@ -818,11 +817,11 @@ static bool credOpen(const uint8_t master[32], const uint8_t rpIdHash[32],
     return true;
 }
 
-// Persistent, so the counter never goes backwards across power cycles
+// The secure element's monotonic counter 1: it can never go backwards
 // (RPs treat a decreasing counter as a cloned authenticator).
 uint32_t SoteriaU2F::nextSignCount() {
-    uint32_t count = _eeprom->readFidoCounter() + 1;
-    _eeprom->writeFidoCounter(count);
+    uint32_t count = 0;
+    fidoCounter(count, true);
     return count;
 }
 
@@ -1001,7 +1000,7 @@ void SoteriaU2F::ctap2MakeCredential(const uint8_t* req, uint16_t reqLen) {
 
     // No master secret until a wallet has been generated on the device.
     uint8_t master[32];
-    if (!_eeprom || !loadFidoSecret(*_eeprom, master)) {
+    if (!loadFidoSecret(master)) {
         ctap2SendStatus(CTAP2_ERR_OPERATION_DENIED);
         return;
     }
@@ -1026,7 +1025,8 @@ void SoteriaU2F::ctap2MakeCredential(const uint8_t* req, uint16_t reqLen) {
     uint8_t st = waitForUserPresence("Register?", rpId.data, (uint16_t)rpId.arg);
     if (st != CTAP2_OK) { ctap2SendStatus(st); return; }
 
-    // New credential: a random nonce (ADC noise, whitened with SHA-256)
+    // New credential: a random nonce (secure element RNG mixed with ADC
+    // noise, whitened with SHA-256)
     // plus key and tag derived from it. Retry in the ~2^-32 case where the
     // HMAC output is not a valid P-256 scalar.
     uint8_t credId[FIDO_CRED_ID_LEN];
@@ -1036,7 +1036,7 @@ void SoteriaU2F::ctap2MakeCredential(const uint8_t* req, uint16_t reqLen) {
     for (int attempt = 0; attempt < 4 && !keyOk; attempt++) {
         ctaphidSendKeepalive(_rxCid, CTAPHID_STATUS_PROCESSING);
         uint8_t noise[16 + 4];
-        RNGpin(noise, 16);
+        walletRandom(noise, 16);
         uint32_t now = micros();
         memcpy(noise + 16, &now, 4);
         uint8_t h[32];
@@ -1146,7 +1146,7 @@ void SoteriaU2F::ctap2GetAssertion(const uint8_t* req, uint16_t reqLen) {
     }
 
     uint8_t master[32];
-    if (!_eeprom || !loadFidoSecret(*_eeprom, master)) {
+    if (!loadFidoSecret(master)) {
         ctap2SendStatus(CTAP2_ERR_NO_CREDENTIALS);
         return;
     }
@@ -1176,8 +1176,10 @@ void SoteriaU2F::ctap2GetAssertion(const uint8_t* req, uint16_t reqLen) {
 
     // Authenticator data: rpIdHash(32) | flags(UP) | signCount(4) | hash(32)
     // Silent probes (platforms filter allowLists with them; the RP never
-    // sees the result) reuse the current count instead of wearing EEPROM.
-    uint32_t signCount = wantUp ? nextSignCount() : _eeprom->readFidoCounter();
+    // sees the result) reuse the current count instead of advancing it.
+    uint32_t signCount = 0;
+    if (wantUp) signCount = nextSignCount();
+    else fidoCounter(signCount, false);
     uint8_t authData[69];
     memcpy(authData, rpIdHash, 32);
     authData[32] = wantUp ? 0x01 : 0x00;

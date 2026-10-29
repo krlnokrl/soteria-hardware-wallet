@@ -13,27 +13,12 @@ static const Network *net(bool testnet) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Root encryption                                                     */
+/* Wallet record and root                                              */
 /* ------------------------------------------------------------------ */
 
-// 64-byte keystream for (secret | chain code): SHA-512(PIN | label).
-static void rootKeystream(const uint8_t pin[5], uint8_t ks[64]) {
-    uint8_t buf[5 + 15];
-    memcpy(buf, pin, 5);
-    memcpy(buf + 5, "soteria-hd-root", 15);
-    sha512(buf, sizeof(buf), ks);
-}
-
-void hdMakeRecord(const HDPrivateKey &root, const uint8_t pin[5], HdRecord &rec) {
+void hdMakeRecord(const HDPrivateKey &root, HdRecord &rec) {
     memset(&rec, 0, sizeof(rec));
     rec.magic = HD_RECORD_MAGIC;
-
-    uint8_t plain[64], ks[64];
-    root.getSecret(plain);
-    memcpy(plain + 32, root.chainCode, 32);
-    rootKeystream(pin, ks);
-    for (int i = 0; i < 64; i++) rec.encRoot[i] = plain[i] ^ ks[i];
-    memset(plain, 0, sizeof(plain));
     root.fingerprint(rec.fingerprint);
 
     for (int t = 0; t < 2; t++) {
@@ -45,12 +30,13 @@ void hdMakeRecord(const HDPrivateKey &root, const uint8_t pin[5], HdRecord &rec)
     }
 }
 
-bool hdUnlock(const HdRecord &rec, const uint8_t pin[5], HDPrivateKey &root) {
-    uint8_t plain[64], ks[64];
-    rootKeystream(pin, ks);
-    for (int i = 0; i < 64; i++) plain[i] = rec.encRoot[i] ^ ks[i];
-    root = HDPrivateKey(plain, plain + 32);
-    memset(plain, 0, sizeof(plain));
+void hdRootBytes(const HDPrivateKey &root, uint8_t out[64]) {
+    root.getSecret(out);
+    memcpy(out + 32, root.chainCode, 32);
+}
+
+bool hdRootFromBytes(const uint8_t bytes[64], const HdRecord &rec, HDPrivateKey &root) {
+    root = HDPrivateKey(bytes, bytes + 32);
     uint8_t fp[4];
     root.fingerprint(fp);
     return memcmp(fp, rec.fingerprint, 4) == 0;

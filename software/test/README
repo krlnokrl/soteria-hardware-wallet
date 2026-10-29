@@ -13,16 +13,31 @@ Host tests (PlatformIO `native` environment, needs gcc/g++ on the PC)
 --------------------------------------------------------------------
 
 The hardware-independent firmware sources (src/crypto, src/u2f.cpp,
-src/buttons.cpp, src/utils.cpp, SecureStorage) are compiled for the PC and
-linked against stand-ins for Arduino, the I2C EEPROM, USB HID and the OLED
-(test/libs/HostStubs). Expected values come from independent sources: the
-BIP39/BIP44/BIP84 test vectors, embit and eth-account.
+src/buttons.cpp, src/utils.cpp, SecureStorage, src/se) are compiled for
+the PC and linked against stand-ins for Arduino, the I2C EEPROM, the
+ATECC508A, USB HID and the OLED (test/libs/HostStubs). Expected values
+come from independent sources: the BIP39/BIP44/BIP84 test vectors, embit
+and eth-account.
 
   test_wallet   BIP39 words; BIP84 SegWit and BIP44 legacy/ETH addresses of
                 the "abandon ... about" test mnemonic; output descriptor;
-                PIN-encrypted root; Ethereum transaction signature; ERC-20
-                recognition; PSBT review, signing (signature verified) and
-                merging; malformed PSBTs refused.
+                root bytes for the secure element; Ethereum transaction
+                signature; ERC-20 recognition; PSBT review, signing
+                (signature verified) and merging; malformed PSBTs refused.
+  test_atecc    ATECC508A driver against a fake chip on the stub I2C bus:
+                CRC reference packets, wake, Info, config read and decoding,
+                retries, timeouts, only read-only commands sent; invariants
+                of the slot map (nothing lockable, every slot rewritable via
+                the PUK, secrets never readable, known encodings) and the
+                config built from it. The encrypted commands are verified
+                on the chip itself by env:seprov_* (command 'v').
+  test_se_wallet  wallet secrets in the secure element (src/se/se_wallet.cpp)
+                against a fake ATECC508A that enforces the slot rules
+                (encrypted read/write only with the right key, write MAC,
+                MAC, counters): create, unlock, wrong PIN count, PUK needed
+                for a new wallet, PIN change, wipe, factory reset, FIDO2
+                secret and counter, randomness. The same flows run on the
+                real chip with env:seprov_* ('WALLET TEST').
   test_u2f      FIDO2 over emulated USB HID: register, sign in, verify the
                 attestation and assertion signatures, sign in again after a
                 reboot, NO button denies, wrong site / no wallet refused.

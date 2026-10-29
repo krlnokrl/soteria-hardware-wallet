@@ -281,9 +281,9 @@
       ['Firmware', r.fw + ' (protocol ' + r.proto + ')'],
       ['Wallet', r.wallet ? (r.name ? '"' + r.name + '"' : 'unnamed') : 'none – generate on device'],
       ['FIDO2', !r.fido.supported ? 'not in this build'
-        : r.fido.ready ? 'ready, counter ' + r.fido.counter : 'not provisioned (regenerate wallet)'],
-      ['Bitcoin', r.wallet ? (r.segwit ? 'native SegWit (BIP84) + PSBT'
-        : 'legacy only (wallet predates SegWit: regenerate)') : '–'],
+        : r.fido.ready ? 'ready, counter ' + r.fido.counter : 'no wallet yet'],
+      ['Secure element', r.secure_element && r.secure_element.ready
+        ? 'ATECC508A ' + r.secure_element.serial : 'not ready (provision with env:seprov)'],
       ['Host access', r.host_access ? 'granted' : 'not yet granted'],
       ['Max payload', r.limits.max_payload + ' bytes, ' + r.limits.free_ram + ' bytes RAM free'],
     ]);
@@ -339,9 +339,14 @@
     await refreshInfo();
   }));
 
+  $('pin-btn').addEventListener('click', (e) => run(e.target, async () => {
+    await request('change_pin');   // current PIN, PUK and new PIN on the device
+  }));
+
   $('erase-btn').addEventListener('click', (e) => run(e.target, async () => {
     if (!confirm('Erase the wallet? Funds are only recoverable with the 12 backup words, ' +
-                 'and FIDO2 registrations made with this wallet stop working.')) return;
+                 'and FIDO2 registrations made with this wallet stop working. ' +
+                 'The device asks for the PIN (or the PUK for a factory reset).')) return;
     await request('erase');
     $('wallet-out').innerHTML = '';
     await refreshInfo();

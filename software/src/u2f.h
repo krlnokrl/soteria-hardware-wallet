@@ -59,8 +59,8 @@
 /*                                                                     */
 /* Non-resident and stateless: nothing per-site is stored. The         */
 /* credential id the RP keeps is nonce(16) | tag(16) and both the       */
-/* P-256 key and the tag are HMACs of the FIDO master secret (EEPROM    */
-/* key slot FIDO_KEY_SLOT) over rpIdHash | nonce, so credentials        */
+/* P-256 key and the tag are HMACs of the FIDO master secret (secure   */
+/* element slot 5) over rpIdHash | nonce, so credentials                */
 /* survive power cycles and there is no slot limit.                     */
 /* ------------------------------------------------------------------ */
 
@@ -78,9 +78,9 @@ public:
 
     // Call once from setup(). Registers the HID interface when the core
     // supports PluggableUSB; otherwise a no-op. The display and buttons
-    // are used for the user-presence prompt, the EEPROM for the master
-    // secret and signature counter.
-    bool begin(Adafruit_SSD1306 &display, SecureStorage &eeprom);
+    // are used for the user-presence prompt; the master secret and the
+    // signature counter live in the secure element (wallet.h).
+    bool begin(Adafruit_SSD1306 &display);
 
     // Call repeatedly from loop(). Services incoming HID reports.
     void poll();
@@ -141,7 +141,6 @@ private:
 #endif
 
     Adafruit_SSD1306* _display;
-    SecureStorage*    _eeprom;
 };
 
 extern SoteriaU2F gU2F;

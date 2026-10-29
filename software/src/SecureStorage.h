@@ -8,16 +8,16 @@
 #define EEPROM_ADDRESS 0x50  // I2C address of the EEPROM
 #define EEPROM_PAGE_SIZE 32  // GT24C64A write page; writes must not cross it
 #define EEPROM_WRITE_TIMEOUT_MS 10  // max internal write cycle (datasheet: 5 ms)
-#define KEY_STORAGE_SIZE 6  // Number of keys that can be stored
 
 // Storage Offsets
-#define KEY_STORAGE_OFFSET 0x0000
+#define LEGACY_KEYS_OFFSET  0x0000  // key slots of firmware < 0.5.0 (secret!)
+#define LEGACY_KEYS_SIZE    0x0200
 #define FLAG_STORAGE_OFFSET 0x0200
 #define NAME_STORAGE_OFFSET 0x0210
 #define NAME_LENGTH 8
 #define NAME_STORAGE_SIZE 8
-#define FIDO_COUNTER_OFFSET 0x0260  // 32-bit FIDO2 signature counter
-#define HD_RECORD_OFFSET 0x0280     // HdRecord (296 bytes)
+#define HD_RECORD_OFFSET 0x0280     // HdRecord (331 bytes)
+#define SE_RECORD_OFFSET 0x0400     // SeRecord (48 bytes)
 
 class SecureStorage {
 private:
@@ -26,26 +26,6 @@ private:
 public:
     SecureStorage(uint8_t eepromAddress = EEPROM_ADDRESS) : _eepromAddress(eepromAddress) {}
     
-    // Store a key in EEPROM
-    void storeKey(uint8_t index, const Key &key) {
-        if (index >= KEY_STORAGE_SIZE) return;
-        
-        uint8_t *data = (uint8_t *)&key;
-        uint16_t address = KEY_STORAGE_OFFSET + index * sizeof(Key);
-        
-        writeBlock(address, data, sizeof(Key));
-    }
-
-    // Read a key from EEPROM
-    void getKey(uint8_t index, Key &key) {
-        if (index >= KEY_STORAGE_SIZE) return;
-        
-        uint8_t *data = (uint8_t *)&key;
-        uint16_t address = KEY_STORAGE_OFFSET + index * sizeof(Key);
-        
-        readBlock(address, data, sizeof(Key));
-    }
-
     // Write a flag value to EEPROM
     void writeFlag(uint8_t index, uint16_t value) {
         uint16_t address = FLAG_STORAGE_OFFSET + index * sizeof(uint16_t);
@@ -93,18 +73,7 @@ public:
         name = String(buffer);
     }
 
-    // FIDO2 signature counter; erased EEPROM (0xFFFFFFFF) counts as 0.
-    uint32_t readFidoCounter() {
-        uint32_t value = 0;
-        readBlock(FIDO_COUNTER_OFFSET, (uint8_t *)&value, sizeof(value));
-        return value == 0xFFFFFFFFUL ? 0 : value;
-    }
-
-    void writeFidoCounter(uint32_t value) {
-        writeBlock(FIDO_COUNTER_OFFSET, (uint8_t *)&value, sizeof(value));
-    }
-
-    // HD wallet root; false if none was stored (pre-SegWit wallets).
+    // Public wallet data; false if there is no wallet.
     bool readHd(HdRecord &rec) {
         readBlock(HD_RECORD_OFFSET, (uint8_t *)&rec, sizeof(rec));
         rec.xpub[0][HD_XPUB_LEN - 1] = 0;
@@ -120,6 +89,26 @@ public:
         HdRecord blank;
         memset(&blank, 0xFF, sizeof(blank));
         writeHd(blank);
+    }
+
+    // Overwrite the private-key slots firmware < 0.5.0 kept in the EEPROM
+    // (masked only with the PIN); this firmware never reads them.
+    void eraseLegacyKeys() {
+        uint8_t blank[EEPROM_PAGE_SIZE];
+        memset(blank, 0xFF, sizeof(blank));
+        for (uint16_t a = LEGACY_KEYS_OFFSET; a < LEGACY_KEYS_OFFSET + LEGACY_KEYS_SIZE; a += EEPROM_PAGE_SIZE) {
+            writeBlock(a, blank, sizeof(blank));
+        }
+    }
+
+    // Secure element pairing; false if the device was never provisioned.
+    bool readSe(SeRecord &rec) {
+        readBlock(SE_RECORD_OFFSET, (uint8_t *)&rec, sizeof(rec));
+        return rec.magic == SE_RECORD_MAGIC;
+    }
+
+    void writeSe(const SeRecord &rec) {
+        writeBlock(SE_RECORD_OFFSET, (const uint8_t *)&rec, sizeof(rec));
     }
 
 private:
@@ -175,4 +164,4 @@ private:
     }
 };
 
-#endif // SECURE_STORAGE_H
+#endif // SECURE_STORAGE_H

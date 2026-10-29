@@ -11,11 +11,15 @@
 /* and PSBT (BIP174) review and signing.                                */
 /* ------------------------------------------------------------------ */
 
-// Fill rec from the wallet root; the root is XOR-encrypted with the PIN.
-void hdMakeRecord(const HDPrivateKey &root, const uint8_t pin[5], HdRecord &rec);
+// Fill rec (public data only) from the wallet root.
+void hdMakeRecord(const HDPrivateKey &root, HdRecord &rec);
 
-// Decrypt the root with pin; false if the PIN is wrong.
-bool hdUnlock(const HdRecord &rec, const uint8_t pin[5], HDPrivateKey &root);
+// The root as sealed in the secure element: secret (32) | chain code (32).
+void hdRootBytes(const HDPrivateKey &root, uint8_t out[64]);
+
+// Rebuild the root from those bytes; false unless it is rec's wallet
+// (fingerprint check).
+bool hdRootFromBytes(const uint8_t bytes[64], const HdRecord &rec, HDPrivateKey &root);
 
 // Receive (change = 0) or change (1) address #index, e.g. "bc1q...".
 size_t hdAddress(const HdRecord &rec, bool testnet, uint32_t change, uint32_t index,

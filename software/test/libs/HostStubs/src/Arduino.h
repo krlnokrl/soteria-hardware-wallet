@@ -19,5 +19,6 @@ typedef uint8_t byte;
 uint32_t millis();
 uint32_t micros();
 void delay(uint32_t ms);
+void delayMicroseconds(uint32_t us);
 int digitalRead(int pin);
 int analogRead(int pin);
