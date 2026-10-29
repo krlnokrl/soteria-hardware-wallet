@@ -60,8 +60,7 @@ int RNGpin(uint8_t *dest, unsigned size) {
       }
 
       // Post-read CPU core timing jitter
-      uint32_t t2 = SysTick->VAL;
-      uint32_t timingJitter = t1 ^ t2;
+      uint32_t timingJitter = t1 ^ SysTick->VAL;
 
       // Blend noise sources (init, red, count, jitter)
       uint32_t bitSource = (init ^ red ^ count ^ timingJitter) & 0x01;
