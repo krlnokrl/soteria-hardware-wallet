@@ -79,6 +79,17 @@ w.fetch = async (url, opts) => {
 w.eval(read('chain.js'));
 w.eval(read('app.js'));
 const lastRequest = (cmd) => received.map((l) => JSON.parse(l)).filter((r) => r.cmd === cmd).pop();
+test.after(() => w.close());   // stops pending page timers (toasts)
+
+test('tabs switch their panels', () => {
+  const tab = w.document.querySelector('[aria-controls="panel-sign"]');
+  tab.click();
+  assert.strictEqual($('panel-sign').hidden, false);
+  assert.strictEqual($('panel-wallet').hidden, true);
+  assert.strictEqual(tab.getAttribute('aria-selected'), 'true');
+  w.document.querySelector('[aria-controls="panel-wallet"]').click();
+  assert.strictEqual($('panel-sign').hidden, true);
+});
 
 test('connect: DTR asserted, device info shown', async () => {
   $('connect-btn').click();
@@ -93,9 +104,12 @@ test('request waiting for the device shows the confirm banner, then the result',
   $('addresses-btn').click();
   await tick(60);
   assert.strictEqual($('confirm-banner').hidden, false);
+  assert.strictEqual($('status-text').textContent, 'Waiting for device');
+  assert.match($('confirm-what').textContent, /Allow reading the addresses/);
   await tick(200);
   assert.strictEqual($('confirm-banner').hidden, true);
-  assert.match($('wallet-out').textContent, /bc1qtest/);
+  assert.match($('addr-out').textContent, /bc1qtest/);
+  assert.strictEqual($('status-text').textContent, 'Connected');
 });
 
 test('Ethereum: prepare, sign the exact transaction on the device, broadcast', async () => {

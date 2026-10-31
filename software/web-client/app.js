@@ -21,16 +21,47 @@
   let reader = null;
   let buffer = '';
   let nextId = 1;
+  let closing = false;
+  let waitingForUser = false;
+  let lastResult = '';
   const pending = new Map();   // id -> {resolve, reject, timer, cmd}
 
+  // What the user has to do on the device, by command.
+  const PROMPTS = {
+    addresses: 'Allow reading the addresses',
+    xpubs: 'Allow reading the xpubs',
+    pubkeys: 'Allow reading the public keys',
+    show_address: 'Compare the address on the screen',
+    set_name: 'Confirm the new name',
+    erase: 'Confirm twice, then enter the PIN (or PUK)',
+    change_pin: 'Enter the current PIN, PUK and new PIN',
+    sign_psbt: 'Review payments, fee and change, then enter the PIN',
+    sign_btc: 'Review each output, then enter the PIN',
+    sign_eth_tx: 'Review chain, recipient, value and fee, then enter the PIN',
+    sign_eth_message: 'Review the message, then enter the PIN',
+    sign_eth_hash: 'Blind signature: confirm, then enter the PIN',
+  };
+
   /* ---------- UI helpers ---------- */
+
+  // Status pill: disconnected / connecting / connected / busy / confirm / error.
+  function setStatus(state, text) {
+    indicator.dataset.state = state;
+    statusText.textContent = text;
+  }
+
+  function updateStatus() {
+    if (!port) return;
+    if (waitingForUser) setStatus('confirm', 'Waiting for device');
+    else if (pending.size) setStatus('busy', 'Working…');
+    else setStatus('connected', 'Connected');
+  }
 
   function setConnected(connected, portName = '') {
     connectBtn.textContent = connected ? 'Disconnect' : 'Connect';
     connectBtn.classList.toggle('connected', connected);
-    indicator.classList.toggle('connected', connected);
-    indicator.classList.toggle('disconnected', !connected);
-    statusText.textContent = connected ? 'Connected' : 'Disconnected';
+    if (connected) setStatus('connected', 'Connected');
+    else setStatus('disconnected', 'Disconnected');
     portInfo.textContent = connected && portName ? portName : '';
     document.querySelectorAll('.needs-conn').forEach((b) => { b.disabled = !connected; });
     if (!connected) {
@@ -49,24 +80,151 @@
   const logSystem = (text) => log(text, 'system');
   const logError = (text) => log(text, 'error');
 
-  function showBanner(what) {
-    banner.hidden = !what;
-    $('confirm-what').textContent = what || '';
+  function toast(text, kind = 'info') {
+    const div = document.createElement('div');
+    div.className = 'toast ' + kind;
+    const span = document.createElement('span');
+    span.textContent = text;
+    const close = document.createElement('button');
+    close.textContent = '×';
+    close.title = 'Dismiss';
+    close.addEventListener('click', () => div.remove());
+    div.append(span, close);
+    $('toasts').appendChild(div);
+    setTimeout(() => div.remove(), kind === 'error' ? 10000 : 4000);
   }
 
+  function showBanner(cmd) {
+    waitingForUser = !!cmd;
+    banner.hidden = !cmd;
+    $('confirm-what').textContent = cmd ? PROMPTS[cmd] || cmd : '';
+    updateStatus();
+  }
+
+  function copyText(text, btn) {
+    navigator.clipboard.writeText(text).then(() => {
+      if (!btn) return toast('Copied to clipboard.', 'ok');
+      const label = btn.textContent;
+      btn.textContent = 'Copied';
+      btn.classList.add('done');
+      setTimeout(() => { btn.textContent = label; btn.classList.remove('done'); }, 1500);
+    }, () => toast('Clipboard not available.', 'error'));
+  }
+
+  // entries: [key, value, tone?] with tone 'ok' / 'warn' for a coloured dot
   function fillKv(dl, entries) {
     dl.innerHTML = '';
-    for (const [k, v] of entries) {
+    for (const [k, v, tone] of entries) {
       const dt = document.createElement('dt');
       dt.textContent = k;
       const dd = document.createElement('dd');
-      dd.textContent = v;
+      if (tone) {
+        const dot = document.createElement('span');
+        dot.className = 'tone ' + tone;
+        dd.appendChild(dot);
+      }
+      dd.append(v);
       dl.append(dt, dd);
     }
   }
 
+  // A labelled code block with a copy button.
+  function codeField(label, value, meta) {
+    const box = document.createElement('div');
+    box.className = 'field';
+    const head = document.createElement('div');
+    head.className = 'field-head';
+    const l = document.createElement('span');
+    l.className = 'field-label';
+    l.textContent = label;
+    head.appendChild(l);
+    if (meta) {
+      const m = document.createElement('span');
+      m.className = 'field-meta';
+      m.textContent = meta;
+      head.appendChild(m);
+    }
+    const btn = document.createElement('button');
+    btn.className = 'copy';
+    btn.textContent = 'Copy';
+    btn.addEventListener('click', () => copyText(String(value), btn));
+    head.appendChild(btn);
+    const pre = document.createElement('pre');
+    const code = document.createElement('code');
+    code.textContent = String(value);
+    pre.appendChild(code);
+    box.append(head, pre);
+    return box;
+  }
+
+  function groupTitle(text, badge, badgeClass = '') {
+    const h = document.createElement('div');
+    h.className = 'group-title';
+    h.textContent = text;
+    if (badge) {
+      const b = document.createElement('span');
+      b.className = 'badge ' + badgeClass;
+      b.textContent = badge;
+      h.appendChild(b);
+    }
+    return h;
+  }
+
+  // rows: [label, value, meta?] (skipped if value is missing) or a node such as a group title
+  function fillFields(container, rows) {
+    container.innerHTML = '';
+    for (const r of rows) {
+      if (r instanceof window.Node) container.appendChild(r);
+      else if (r[1] != null) container.appendChild(codeField(r[0], r[1], r[2]));
+    }
+  }
+
+  function callout(text, kind) {
+    const p = document.createElement('p');
+    p.className = 'callout callout-' + kind;
+    p.textContent = text;
+    return p;
+  }
+
+  // Sign results: an object becomes one code block per field, a string a message.
   function showResult(obj) {
-    signOut.textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2);
+    signOut.innerHTML = '';
+    if (typeof obj === 'string') {
+      lastResult = obj;
+      signOut.appendChild(callout(obj, obj.startsWith('Error') ? 'error' : 'ok'));
+      return;
+    }
+    lastResult = JSON.stringify(obj, null, 2);
+    fillFields(signOut, Object.entries(obj).map(([k, v]) =>
+      [k, typeof v === 'object' ? JSON.stringify(v, null, 2) : v]));
+  }
+
+  /* ---------- Tabs ---------- */
+
+  function selectTab(tab) {
+    for (const t of tab.parentElement.querySelectorAll('[role="tab"]')) {
+      const selected = t === tab;
+      t.setAttribute('aria-selected', selected);
+      t.tabIndex = selected ? 0 : -1;
+      $(t.getAttribute('aria-controls')).hidden = !selected;
+    }
+  }
+
+  for (const list of document.querySelectorAll('[role="tablist"]')) {
+    const tabs = [...list.querySelectorAll('[role="tab"]')];
+    for (const t of tabs) {
+      t.tabIndex = t.getAttribute('aria-selected') === 'true' ? 0 : -1;
+      t.addEventListener('click', () => selectTab(t));
+    }
+    list.addEventListener('keydown', (e) => {   // arrow keys move between tabs
+      const step = { ArrowRight: 1, ArrowLeft: -1 }[e.key];
+      const i = tabs.indexOf(document.activeElement);
+      if (!step || i < 0) return;
+      e.preventDefault();
+      const next = tabs[(i + step + tabs.length) % tabs.length];
+      selectTab(next);
+      next.focus();
+    });
   }
 
   /* ---------- Serial transport ---------- */
@@ -79,6 +237,7 @@
     try {
       // No vendor filter: Feather M0 builds use VID 0x239a, M0 Pro boards others.
       port = await navigator.serial.requestPort();
+      setStatus('connecting', 'Connecting…');
       await port.open({ baudRate: BAUD });
       // The firmware only transmits while the host asserts DTR.
       await port.setSignals({ dataTerminalReady: true, requestToSend: true });
@@ -101,12 +260,16 @@
       await refreshInfo();
     } catch (err) {
       logError('Error: ' + err.message);
+      // Closing the port chooser is not an error worth a toast.
+      if (err.name !== 'NotFoundError') toast('Connection failed: ' + err.message, 'error');
       port = null;
       setConnected(false);
     }
   }
 
   async function disconnect() {
+    if (closing) return;
+    closing = true;
     for (const [, p] of pending) {
       clearTimeout(p.timer);
       p.reject(new Error('disconnected'));
@@ -120,6 +283,8 @@
       logError('Disconnect error: ' + err.message);
     } finally {
       port = null;
+      writer = reader = null;
+      closing = false;
       setConnected(false);
       logSystem('Disconnected.');
     }
@@ -139,7 +304,12 @@
         }
       }
     } catch (err) {
-      if (port) logError('Read error: ' + err.message);
+      if (port && !closing) logError('Read error: ' + err.message);
+    }
+    // The stream ended without Disconnect being clicked: device unplugged or reset.
+    if (port && !closing) {
+      toast('Device disconnected.', 'error');
+      await disconnect();
     }
   }
 
@@ -201,9 +371,11 @@
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => expire(id), REPLY_TIMEOUT_MS);
       pending.set(id, { resolve, reject, timer, cmd });
+      updateStatus();
       sendLine(JSON.stringify({ id, cmd, ...params })).catch((err) => {
         pending.delete(id);
         clearTimeout(timer);
+        updateStatus();
         reject(err);
       });
     });
@@ -221,7 +393,8 @@
     } catch (err) {
       const text = (err.code ? err.code + ': ' : '') + err.message;
       logError(text);
-      showResult('Error – ' + text);
+      toast(text, 'error');
+      if (btn.closest('#panel-sign')) showResult('Error – ' + text);
     } finally {
       if (!('manual' in btn.dataset)) btn.disabled = btn.classList.contains('needs-conn') && !port;
       else if (!ok) btn.disabled = false;
@@ -277,14 +450,17 @@
 
   async function refreshInfo() {
     const r = await request('info');
+    const se = r.secure_element && r.secure_element.ready;
     fillKv($('device-info'), [
       ['Firmware', r.fw + ' (protocol ' + r.proto + ')'],
-      ['Wallet', r.wallet ? (r.name ? '"' + r.name + '"' : 'unnamed') : 'none – generate on device'],
+      ['Wallet', r.wallet ? (r.name ? '"' + r.name + '"' : 'unnamed') : 'none – generate on device',
+        r.wallet ? 'ok' : 'warn'],
       ['FIDO2', !r.fido.supported ? 'not in this build'
-        : r.fido.ready ? 'ready, counter ' + r.fido.counter : 'no wallet yet'],
-      ['Secure element', r.secure_element && r.secure_element.ready
-        ? 'ATECC508A ' + r.secure_element.serial : 'not ready (provision with env:seprov)'],
-      ['Host access', r.host_access ? 'granted' : 'not yet granted'],
+        : r.fido.ready ? 'ready, counter ' + r.fido.counter : 'no wallet yet',
+        r.fido.supported && r.fido.ready ? 'ok' : undefined],
+      ['Secure element', se ? 'ATECC508A ' + r.secure_element.serial : 'not ready (provision with env:seprov)',
+        se ? 'ok' : 'warn'],
+      ['Host access', r.host_access ? 'granted' : 'not yet granted', r.host_access ? 'ok' : undefined],
       ['Max payload', r.limits.max_payload + ' bytes, ' + r.limits.free_ram + ' bytes RAM free'],
     ]);
   }
@@ -293,24 +469,31 @@
 
   $('addresses-btn').addEventListener('click', (e) => run(e.target, async () => {
     const r = await request('addresses');
-    const rows = [];
-    if (r.btc) rows.push(['BTC', r.btc], ['BTC testnet', r.btc_testnet]);
-    rows.push(['BTC legacy', r.btc_legacy], ['BTC test legacy', r.btc_testnet_legacy],
-              ['ETH / EVM', r.eth]);
-    fillKv($('wallet-out'), rows);
+    fillFields($('addr-out'), [
+      groupTitle('Bitcoin', 'mainnet', 'badge-btc'),
+      ['Native SegWit', r.btc, 'm/84\'/0\'/0\'/0/0'],
+      ['Legacy', r.btc_legacy, 'm/44\'/0\'/0\'/0/0'],
+      groupTitle('Bitcoin', 'testnet', 'badge-test'),
+      ['Native SegWit', r.btc_testnet, 'm/84\'/1\'/0\'/0/0'],
+      ['Legacy', r.btc_testnet_legacy, 'm/44\'/1\'/0\'/0/0'],
+      groupTitle('Ethereum / EVM', 'all chains', 'badge-eth'),
+      ['Address', r.eth, 'm/44\'/60\'/0\'/0/0'],
+    ]);
     if (!$('evm-from').value) $('evm-from').value = r.eth;
   }));
 
   $('xpubs-btn').addEventListener('click', (e) => run(e.target, async () => {
     const r = await request('xpubs');
-    fillKv($('wallet-out'), [
-      ['Fingerprint', r.fingerprint],
-      ['BTC xpub', r.btc.path + ' ' + r.btc.xpub],
-      ['BTC receive', r.btc.receive],
-      ['BTC change', r.btc.change],
-      ['Testnet tpub', r.btc_testnet.path + ' ' + r.btc_testnet.xpub],
-      ['Testnet receive', r.btc_testnet.receive],
-      ['Testnet change', r.btc_testnet.change],
+    fillFields($('xpub-out'), [
+      ['Master fingerprint', r.fingerprint],
+      groupTitle('Bitcoin', 'mainnet', 'badge-btc'),
+      ['xpub', r.btc.xpub, r.btc.path],
+      ['Receive descriptor', r.btc.receive],
+      ['Change descriptor', r.btc.change],
+      groupTitle('Bitcoin', 'testnet', 'badge-test'),
+      ['tpub', r.btc_testnet.xpub, r.btc_testnet.path],
+      ['Receive descriptor', r.btc_testnet.receive],
+      ['Change descriptor', r.btc_testnet.change],
     ]);
   }));
 
@@ -321,15 +504,20 @@
       index,
       change: $('verify-change').checked ? 1 : 0,
     });
-    showResult({
-      address: r.address,
-      device: r.confirmed ? 'user confirmed it matches' : 'user reported a MISMATCH – do not use',
-    });
+    fillFields($('verify-out'), [
+      ['Address', r.address, $('verify-coin').selectedOptions[0].textContent + ' #' + index],
+      r.confirmed ? callout('You confirmed on the device that it matches.', 'ok')
+        : callout('You reported a MISMATCH on the device – do not use this address.', 'error'),
+    ]);
   }));
 
   $('pubkeys-btn').addEventListener('click', (e) => run(e.target, async () => {
     const r = await request('pubkeys');
-    fillKv($('wallet-out'), [['BTC', r.btc], ['BTC testnet', r.btc_testnet], ['ETH', r.eth]]);
+    fillFields($('pubkey-out'), [
+      ['Bitcoin', r.btc, '33-byte compressed'],
+      ['Bitcoin testnet', r.btc_testnet, '33-byte compressed'],
+      ['Ethereum / EVM', r.eth, '65-byte uncompressed'],
+    ]);
   }));
 
   $('name-btn').addEventListener('click', (e) => run(e.target, async () => {
@@ -348,7 +536,7 @@
                  'and FIDO2 registrations made with this wallet stop working. ' +
                  'The device asks for the PIN (or the PUK for a factory reset).')) return;
     await request('erase');
-    $('wallet-out').innerHTML = '';
+    for (const id of ['addr-out', 'xpub-out', 'pubkey-out', 'verify-out']) $(id).innerHTML = '';
     await refreshInfo();
   }));
 
@@ -371,6 +559,7 @@
       signed_inputs: r.signed_inputs,
       send: btc(r.send), fee: btc(r.fee), change: btc(r.change),
     });
+    toast('Signed. To broadcast it, open Build & send → Bitcoin (already filled in).', 'ok');
   }));
 
   $('ethmsg-btn').addEventListener('click', (e) => run(e.target, async () => {
@@ -542,7 +731,7 @@
       if (!file) return;
       loadPsbtFile(file, $(areaId)).catch((err) => {
         logError(err.message);
-        showResult('Error – ' + err.message);
+        toast(err.message, 'error');
       });
       e.target.value = '';   // allow loading the same file again
     });
@@ -562,7 +751,7 @@
       }
       const { cmd, ...params } = obj;
       delete params.id;
-      showResult(await request(cmd, params));
+      await request(cmd, params);   // the reply is shown in the log
     } else {
       await sendLine(text);
     }
@@ -582,9 +771,7 @@
   });
 
   $('copy-btn').addEventListener('click', () => {
-    navigator.clipboard.writeText(signOut.textContent).then(
-      () => logSystem('Result copied.'),
-      () => logError('Clipboard not available.'));
+    if (lastResult) copyText(lastResult);
   });
 
   $('clear-btn').addEventListener('click', () => {
@@ -597,11 +784,13 @@
     if (port) disconnect();
   });
 
+  setConnected(false);
   if (!('serial' in navigator)) {
     logError('This browser has no Web Serial support – use Chrome or Edge.');
+    toast('This browser has no Web Serial support – use Chrome or Edge.', 'error');
+    setStatus('error', 'No Web Serial');
     connectBtn.disabled = true;
   } else {
     logSystem('Click Connect and choose the Soteria serial port.');
   }
-  setConnected(false);
 })();

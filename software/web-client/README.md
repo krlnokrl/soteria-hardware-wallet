@@ -21,9 +21,15 @@ A browser client for the Soteria firmware's JSON protocol over USB serial.
    ```
 3. Click **Connect** and choose the Soteria serial port. Device info loads automatically.
 
-Requests that need the user (reading addresses the first time after power-on, renaming,
-erasing, signing) show a yellow **Confirm on the device** banner until they are answered
-with the device buttons.
+The page has three tabs: **Wallet** (addresses, xpubs/descriptors and public keys as copyable
+code blocks, address verification, name, PIN, erase), **Sign** and **Build & send**. Device
+status and the protocol log stay visible in the sidebar. Requests that need the user (reading
+addresses the first time after power-on, renaming, erasing, signing) show a yellow
+**Confirm on the device** prompt saying what to do, and the status pill switches to
+*Waiting for device*, until they are answered with the device buttons.
+
+The page is static HTML/CSS/JS with no build step and no runtime dependencies; npm is only
+used to run the tests.
 
 ## Build & send
 
@@ -39,7 +45,7 @@ with the device buttons.
   witness = signature + public key) into a raw transaction, shown with outputs, fee rate and txid,
   and broadcast through the [mempool.space](https://mempool.space) API (mainnet, testnet4,
   testnet3, signet). Creating the PSBT still needs a watch-only wallet with the coins' UTXOs:
-  Sparrow, Electrum, Bitcoin Core or BlueWallet, using the descriptors from *Get xpubs*.
+  Sparrow, Electrum, Bitcoin Core or BlueWallet, using the descriptors from *Wallet → xpubs & descriptors*.
 
 The RPC node and mempool.space see your addresses and IP address; run your own node for privacy.
 Always try a testnet first. Broadcasting asks for confirmation and cannot be undone.
@@ -106,7 +112,7 @@ For serial terminals, a line not starting with `{` is a text command, answered i
   wallet (Sparrow: *New wallet → Import descriptor*; Bitcoin Core: `importdescriptors`) →
   create the transaction there and export the unsigned PSBT (Sparrow: *Finalize Transaction for
   Signing*, then *Save Transaction* for a .psbt file, or copy it as Base64; the raw transaction hex
-  is **not** enough - it lacks input amounts and key paths) → *Sign PSBT* here (paste base64/hex
+  is **not** enough - it lacks input amounts and key paths) → *Sign → BTC PSBT* here (paste base64/hex
   or load the file; tick *testnet* for testnet4/testnet3/signet) → load the
   returned PSBT back into the wallet, finalize and broadcast. Only native SegWit (BIP84,
   `m/84'/0'/0'` and `m/84'/1'/0'` for testnet) single-signature inputs are signed; outputs may
